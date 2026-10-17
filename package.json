@@ -1,0 +1,127 @@
+{
+  "name": "line-comments",
+  "displayName": "Line Comments",
+  "description": "GitHub-style line comment threads in VS Code, outside any pull request, stored as files in your repo.",
+  "publisher": "choandrew",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/choandrew/line-comments"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "comments",
+    "code review",
+    "annotations",
+    "review"
+  ],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "src/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Runs git in the workspace to track lines across commits."
+    }
+  },
+  "contributes": {
+    "configuration": {
+      "title": "Line Comments",
+      "properties": {
+        "lineComments.folder": {
+          "type": "string",
+          "scope": "resource",
+          "markdownDescription": "Folder that holds this repo's comment threads. Point everyone at the same shared folder (Dropbox, Google Drive, OneDrive, a network share) to see each other's comments live. `~` and paths relative to the workspace folder work. Use one folder per repo."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "lineComments.comment",
+        "title": "Comment"
+      },
+      {
+        "command": "lineComments.archive",
+        "title": "Archive Thread",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "lineComments.unarchive",
+        "title": "Unarchive Thread",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "lineComments.delete",
+        "title": "Delete Thread",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "lineComments.toggleArchived",
+        "title": "Show/Hide Archived Threads",
+        "category": "Line Comments",
+        "icon": "$(archive)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "lineComments.comment",
+          "when": "false"
+        },
+        {
+          "command": "lineComments.archive",
+          "when": "false"
+        },
+        {
+          "command": "lineComments.unarchive",
+          "when": "false"
+        },
+        {
+          "command": "lineComments.delete",
+          "when": "false"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "lineComments.comment",
+          "group": "inline",
+          "when": "commentController == line-comments"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "lineComments.archive",
+          "group": "navigation@1",
+          "when": "commentController == line-comments && commentThread == open"
+        },
+        {
+          "command": "lineComments.unarchive",
+          "group": "navigation@1",
+          "when": "commentController == line-comments && commentThread == archived"
+        },
+        {
+          "command": "lineComments.delete",
+          "group": "navigation@2",
+          "when": "commentController == line-comments && commentThread"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "check": "tsc -p . && node --test",
+    "package": "vsce package -o line-comments.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/vscode": "1.90.0",
+    "@vscode/vsce": "4.0.0",
+    "typescript": "5.9.3"
+  }
+}
