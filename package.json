@@ -3,7 +3,7 @@
   "displayName": "Line Comments",
   "description": "GitHub-style line comment threads in VS Code, outside any pull request, shared through a folder or an S3 bucket such as SeaweedFS.",
   "publisher": "choandrew",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -54,6 +54,40 @@
         }
       }
     },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "lineComments",
+          "title": "Line Comments",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "lineComments": [
+        {
+          "id": "lineComments.threads",
+          "name": "Threads"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "lineComments.threads",
+        "when": "lineComments.state == credentials",
+        "contents": "Enter the S3 access key so Line Comments can reach your comments.\n[Set S3 Credentials](command:lineComments.setS3Credentials)"
+      },
+      {
+        "view": "lineComments.threads",
+        "when": "lineComments.state == ready",
+        "contents": "No comments yet. Hover a line number in any file and click + to start a thread."
+      },
+      {
+        "view": "lineComments.threads",
+        "when": "lineComments.state == none",
+        "contents": "Open a git repository with an origin remote to use Line Comments."
+      }
+    ],
     "commands": [
       {
         "command": "lineComments.comment",
@@ -83,7 +117,14 @@
       {
         "command": "lineComments.setS3Credentials",
         "title": "Set S3 Credentials",
-        "category": "Line Comments"
+        "category": "Line Comments",
+        "icon": "$(key)"
+      },
+      {
+        "command": "lineComments.refresh",
+        "title": "Refresh",
+        "category": "Line Comments",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
@@ -127,6 +168,23 @@
           "command": "lineComments.delete",
           "group": "navigation@2",
           "when": "commentController == line-comments && commentThread"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "lineComments.toggleArchived",
+          "group": "navigation@1",
+          "when": "view == lineComments.threads"
+        },
+        {
+          "command": "lineComments.refresh",
+          "group": "navigation@2",
+          "when": "view == lineComments.threads"
+        },
+        {
+          "command": "lineComments.setS3Credentials",
+          "group": "settings",
+          "when": "view == lineComments.threads"
         }
       ]
     }
