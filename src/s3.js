@@ -33,6 +33,29 @@ const unxml = (s) =>
  * @param {Record<string, string>} [query] @param {string} [body]
  */
 async function request(cfg, method, key, query = {}, body = '') {
+  await slot();
+  try {
+    return await send(cfg, method, key, query, body);
+  } finally {
+    release();
+  }
+}
+
+// At most this many requests in flight, so a cold start over a big bucket doesn't open hundreds of sockets.
+const PARALLEL = 16;
+let inFlight = 0;
+/** @type {(() => void)[]} */
+const waiting = [];
+/** @returns {Promise<void>} */
+const slot = () => (inFlight < PARALLEL ? (inFlight++, Promise.resolve()) : new Promise((r) => waiting.push(() => r())));
+const release = () => {
+  const next = waiting.shift();
+  if (next) next();
+  else inFlight--;
+};
+
+/** @param {S3Config} cfg @param {'GET' | 'PUT' | 'DELETE'} method @param {string} key @param {Record<string, string>} query @param {string} body */
+async function send(cfg, method, key, query, body) {
   const origin = new URL(cfg.endpoint);
   const pathname = `/${enc(cfg.bucket)}${key ? `/${key.split('/').map(enc).join('/')}` : ''}`;
   const qs = Object.keys(query)
