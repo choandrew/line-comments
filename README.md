@@ -26,7 +26,8 @@ S3 store needs a key, the side bar asks for one.
 ## Use
 
 - Click `+` next to a line number to start a thread. Anyone can reply.
-- Archive hides a thread; delete removes it.
+- Archive hides a thread; delete removes it. Edit or delete your own comments from their title bar.
+- A dot marks threads with comments you haven't seen, and replies in threads you're in pop up a notification.
 - The Line Comments side bar lists every thread and shows archived ones on request.
 - Comments show only on the default branch (usually `main`) and follow the code as it changes.
 
@@ -42,7 +43,7 @@ does; `--location`, `--endpoint` or `LINE_COMMENTS_LOCATION` override it. Put th
 
 ```
 <location>/<owner>/<repo>/<thread-id>/thread.json        {"path", "line", "text", "commit", "archived"}
-<location>/<owner>/<repo>/<thread-id>/<comment-id>.json  {"author", "body", "at"}
+<location>/<owner>/<repo>/<thread-id>/<comment-id>.json  {"author", "body", "at", "edited"?}
 ```
 
 `line` is 1-based and refers to `commit`.
