@@ -29,10 +29,11 @@ function folder(dir) {
       const out = new Map();
       const start = file(prefix);
       if (!fs.existsSync(start)) return out;
-      for (const rel of fs.readdirSync(start, { recursive: true, encoding: 'utf8' })) {
-        const stat = fs.statSync(path.join(start, rel));
-        if (stat.isFile()) out.set(prefix + rel.split(path.sep).join('/'), `${stat.mtimeMs}:${stat.size}`);
-      }
+      const rels = await fs.promises.readdir(start, { recursive: true, encoding: 'utf8' });
+      const stats = await Promise.all(rels.map((rel) => fs.promises.stat(path.join(start, rel))));
+      rels.forEach((rel, i) => {
+        if (stats[i].isFile()) out.set(prefix + rel.split(path.sep).join('/'), `${stats[i].mtimeMs}:${stats[i].size}`);
+      });
       return out;
     },
     get: (key) => fs.promises.readFile(file(key), 'utf8'),

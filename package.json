@@ -3,7 +3,7 @@
   "displayName": "Line Comments",
   "description": "GitHub-style line comment threads in VS Code, outside any pull request, shared through a folder or an S3 bucket such as SeaweedFS.",
   "publisher": "choandrew",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "license": "MIT",
   "repository": {
     "type": "git",

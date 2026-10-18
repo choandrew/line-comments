@@ -6,13 +6,14 @@ const os = require('os');
 const blob = require('./blob');
 const { S3Error } = require('./s3');
 const store = require('./store');
-const { git, locate } = require('./track');
+const { git, tracker } = require('./track');
 
 /**
  * @typedef {ReturnType<typeof store.open>} Store
  * @typedef {{ root: string, store: Store, id: string }} Ref
  * @typedef {{ state: 'credentials' | 'offMain', detail: string }} Problem
  * @typedef {{ uri: vscode.Uri, line: number, thread: store.Thread }} Listed
+ * @typedef {{ sha: string, branch: string, main: string }} Head
  */
 
 const DEFAULT_LOCATION = '~/.line-comments';
@@ -52,6 +53,15 @@ function activate(context) {
   let errors = new Set();
   let showArchived = false;
   let remote = false;
+  const track = tracker();
+  /** @type {Map<string, Promise<Head>>} per workspace folder, dropped when its HEAD or reflog changes */
+  const heads = new Map();
+  /** @type {Map<string, Promise<string>>} each workspace folder's owner/repo, dropped on rewatch */
+  const repos = new Map();
+  /** @type {Map<string, string>} what each shown thread last drew, so an unchanged one is left alone */
+  const drawn = new Map();
+  let drawnTree = '';
+  const headOf = (/** @type {string} */ root) => memo(heads, root, () => readHead(root));
 
   /** @type {vscode.CommentingRangeProvider} */
   const ranges = {
@@ -70,7 +80,7 @@ function activate(context) {
   async function storeFor(root) {
     const config = vscode.workspace.getConfiguration('lineComments', vscode.Uri.file(root));
     const location = setting(config, 'location');
-    const repo = repoId(root);
+    const repo = await memo(repos, root, () => repoId(root));
     if (location.startsWith('s3://')) {
       const endpoint = setting(config, 's3.endpoint');
       const region = setting(config, 's3.region');
@@ -104,13 +114,13 @@ function activate(context) {
     const failures = [];
     /** @type {Problem | undefined} */
     let problem;
-    /** @type {Map<string, { store: Store, key: string, loaded: store.Loaded[] | undefined }>} */
+    /** @type {Map<string, { store: Store, key: string, sha: string, loaded: store.Loaded[] | undefined }>} */
     const next = new Map();
     remote = false;
     for (const root of roots()) {
       try {
         const found = await storeFor(root);
-        const { branch, main } = branches(root);
+        const { sha, branch, main } = await headOf(root);
         if (branch !== main) {
           problem ??= { state: 'offMain', detail: `${path.basename(root)} is on ${branch}, not ${main}` };
           continue;
@@ -126,7 +136,7 @@ function activate(context) {
           // An unreachable store keeps what is on screen rather than wiping it.
           failures.push(message(e));
         }
-        next.set(root, { store: found.store, key: found.key, loaded });
+        next.set(root, { store: found.store, key: found.key, sha, loaded });
         remote ||= found.remote;
       } catch (e) {
         failures.push(message(e));
@@ -141,28 +151,34 @@ function activate(context) {
     /** @type {Listed[]} */
     const nextListed = [];
     let archived = 0;
-    for (const [root, { store: s, key: storeKey, loaded }] of next) {
+    for (const [root, { store: s, key: storeKey, sha, loaded }] of next) {
       if (loaded === undefined) {
         for (const [key] of shown) if (key.startsWith(`${storeKey}\0`)) seen.add(key);
         nextListed.push(...listed.filter((l) => rootOf(l.uri) === root));
         continue;
       }
+      /** @type {{ id: string, thread: store.Thread }[]} */
+      const visible = [];
       for (const item of loaded) {
         if ('error' in item) {
           failures.push(item.error);
           continue;
         }
         if (item.thread.archived) archived++;
-        if (item.thread.archived && !showArchived) continue;
-        const key = `${storeKey}\0${item.id}`;
-        seen.add(key);
-        nextListed.push(render(key, { root, store: s, id: item.id }, item.thread));
+        if (!item.thread.archived || showArchived) visible.push(item);
       }
+      const placed = await track.locateAll(root, sha, visible.map((v) => v.thread));
+      visible.forEach(({ id, thread }, i) => {
+        const key = `${storeKey}\0${id}`;
+        seen.add(key);
+        nextListed.push(render(key, { root, store: s, id }, thread, placed[i]));
+      });
     }
     for (const [key, thread] of shown) {
       if (seen.has(key)) continue;
       thread.dispose();
       shown.delete(key);
+      drawn.delete(key);
       refs.delete(thread);
     }
 
@@ -171,7 +187,9 @@ function activate(context) {
     errors = new Set(failures);
 
     listed = nextListed;
-    treeChanged.fire();
+    const tree = JSON.stringify(listed.map((l) => [l.uri.toString(), l.line, l.thread]));
+    if (tree !== drawnTree) treeChanged.fire();
+    drawnTree = tree;
     const open = listed.filter((l) => !l.thread.archived).length;
     view.badge = open > 0 ? { value: open, tooltip: `${open} open comment thread${open === 1 ? '' : 's'}` } : undefined;
     view.description = problem?.detail ?? (showArchived ? 'showing archived' : archived > 0 ? `${archived} archived` : undefined);
@@ -228,22 +246,32 @@ function activate(context) {
     pending = setTimeout(guard(sync), 150);
   };
 
-  /** Watches each repo's HEAD and reflog, and each comment folder on disk. */
-  function rewatch() {
+  /** Forgets cached git state, then watches each repo's HEAD and reflog and each comment folder on disk. */
+  async function rewatch() {
     for (const w of watchers) w.dispose();
     watchers = [];
     stores.clear();
-    /** @param {string} base @param {string} glob */
-    const watch = (base, glob) => {
+    heads.clear();
+    repos.clear();
+    track.clear();
+    /** @param {string} base @param {string} glob @param {() => void} changed */
+    const watch = (base, glob, changed) => {
       const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(base), glob));
-      watchers.push(w, w.onDidCreate(resync), w.onDidChange(resync), w.onDidDelete(resync));
+      watchers.push(w, w.onDidCreate(changed), w.onDidChange(changed), w.onDidDelete(changed));
     };
     for (const root of roots()) {
       try {
         // logs/HEAD gains a line on every checkout, commit, pull or reset, so it catches main moving.
-        watch(git(root, 'rev-parse', '--path-format=absolute', '--git-dir'), '{HEAD,logs/HEAD}');
+        const gitDir = await git(root, 'rev-parse', '--path-format=absolute', '--git-dir');
+        watch(gitDir, '{HEAD,logs/HEAD}', () => {
+          heads.delete(root);
+          resync();
+        });
         const location = setting(vscode.workspace.getConfiguration('lineComments', vscode.Uri.file(root)), 'location');
-        if (!location.startsWith('s3://')) watch(path.join(expand(root, location), ...repoId(root).split('/')), '**/*.json');
+        if (!location.startsWith('s3://')) {
+          const repo = await memo(repos, root, () => repoId(root));
+          watch(path.join(expand(root, location), ...repo.split('/')), '**/*.json', resync);
+        }
       } catch {
         // syncOnce() reports the same failure.
       }
@@ -251,11 +279,12 @@ function activate(context) {
     resync();
   }
 
-  /** @param {string} key @param {Ref} ref @param {store.Thread} thread @returns {Listed} */
-  function render(key, ref, thread) {
-    const now = locate(ref.root, thread);
+  /**
+   * @param {string} key @param {Ref} ref @param {store.Thread} thread
+   * @param {import('./track').Located} now @returns {Listed}
+   */
+  function render(key, ref, thread, now) {
     const uri = vscode.Uri.file(path.join(ref.root, now.path));
-    const range = new vscode.Range(now.line, 0, now.line, 0);
     let t = shown.get(key);
     if (t && t.uri.fsPath !== uri.fsPath) {
       // A thread's file is fixed at creation, so a renamed file needs a new thread.
@@ -263,15 +292,22 @@ function activate(context) {
       refs.delete(t);
       t = undefined;
     }
+    const sig = JSON.stringify([now, thread]);
     if (!t) {
-      t = controller.createCommentThread(uri, range, []);
+      t = controller.createCommentThread(uri, new vscode.Range(now.line, 0, now.line, 0), []);
       t.collapsibleState = thread.archived
         ? vscode.CommentThreadCollapsibleState.Collapsed
         : vscode.CommentThreadCollapsibleState.Expanded;
       shown.set(key, t);
+    } else if (drawn.get(key) === sig && t.range.start.line === now.line) {
+      // Reassigning an unchanged thread's fields would still make VS Code redraw its widget. The range is
+      // checked too: VS Code shifts a thread itself when it reloads a file changed on disk.
+      refs.set(t, ref);
+      return { uri, line: now.line, thread };
     }
+    drawn.set(key, sig);
     refs.set(t, ref);
-    t.range = range;
+    t.range = new vscode.Range(now.line, 0, now.line, 0);
     t.comments = thread.comments.map((c) => ({
       body: new vscode.MarkdownString(c.body),
       mode: vscode.CommentMode.Preview,
@@ -294,7 +330,7 @@ function activate(context) {
     if (root === undefined || s === undefined) throw new Error('commenting is off here; see the status bar');
     let author;
     try {
-      author = git(root, 'config', 'user.name');
+      author = await git(root, 'config', 'user.name');
     } catch {
       author = ''; // git exits 1 when the name is unset
     }
@@ -307,7 +343,7 @@ function activate(context) {
       const doc = await vscode.workspace.openTextDocument(thread.uri);
       const line = thread.range.start.line;
       const rel = path.relative(root, thread.uri.fsPath).split(path.sep).join('/');
-      const commit = git(root, 'rev-parse', 'HEAD');
+      const commit = await git(root, 'rev-parse', 'HEAD');
       await s.create({ path: rel, line: line + 1, text: doc.lineAt(line).text, commit }, entry);
       thread.dispose();
     }
@@ -339,12 +375,20 @@ function activate(context) {
     await sync();
   }
 
-  function switchToDefault() {
+  async function switchToDefault() {
     for (const root of roots()) {
-      const { branch, main } = branches(root);
-      if (branch !== main) git(root, 'switch', main);
+      const { branch, main } = await headOf(root);
+      if (branch === main) continue;
+      heads.delete(root);
+      await git(root, 'switch', main);
     }
-    resync();
+    await sync();
+  }
+
+  async function refresh() {
+    heads.clear();
+    track.clear();
+    await sync();
   }
 
   async function setS3Credentials() {
@@ -380,19 +424,21 @@ function activate(context) {
     { dispose: () => clearTimeout(pending) },
     { dispose: () => clearInterval(poll) },
     vscode.workspace.onDidSaveTextDocument(resync),
-    vscode.workspace.onDidChangeWorkspaceFolders(rewatch),
-    vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration('lineComments') && rewatch()),
-    context.secrets.onDidChange(rewatch),
+    // A change that leaves the document clean is a reload from disk (a pull, a checkout), not typing.
+    vscode.workspace.onDidChangeTextDocument((e) => !e.document.isDirty && e.contentChanges.length > 0 && resync()),
+    vscode.workspace.onDidChangeWorkspaceFolders(guard(rewatch)),
+    vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration('lineComments') && guard(rewatch)()),
+    context.secrets.onDidChange(guard(rewatch)),
     vscode.commands.registerCommand('lineComments.comment', guard(comment)),
     vscode.commands.registerCommand('lineComments.archive', guard(archive(true))),
     vscode.commands.registerCommand('lineComments.unarchive', guard(archive(false))),
     vscode.commands.registerCommand('lineComments.delete', guard(remove)),
     vscode.commands.registerCommand('lineComments.toggleArchived', guard(toggleArchived)),
     vscode.commands.registerCommand('lineComments.setS3Credentials', guard(setS3Credentials)),
-    vscode.commands.registerCommand('lineComments.refresh', guard(sync)),
+    vscode.commands.registerCommand('lineComments.refresh', guard(refresh)),
     vscode.commands.registerCommand('lineComments.switchToDefault', guard(switchToDefault)),
   );
-  rewatch();
+  guard(rewatch)();
 }
 
 /** @returns {string[]} */
@@ -419,8 +465,8 @@ function expand(root, location) {
 }
 
 /** The repo's `owner/name` from its origin URL; it keys the repo's threads in a shared location. @param {string} root */
-function repoId(root) {
-  const url = git(root, 'remote', 'get-url', 'origin');
+async function repoId(root) {
+  const url = await git(root, 'remote', 'get-url', 'origin');
   // https://host/owner/repo, git@host:owner/repo, or a local path, which may hold `..`.
   const tail = url.replace(/^[\w+.-]+:\/\/[^/]*/, '').replace(/^[^/@]+@[^:]+:/, '').replace(/(\.git)?\/*$/, '');
   const parts = path.posix.normalize(`/${tail}`).split('/').filter(Boolean).slice(-2);
@@ -433,16 +479,31 @@ function repoId(root) {
 /** @param {string} endpoint */
 const secretKey = (endpoint) => `s3:${endpoint}`;
 
-/** The checked-out branch and the default branch that origin/HEAD names. @param {string} root */
-function branches(root) {
-  const branch = git(root, 'rev-parse', '--abbrev-ref', 'HEAD');
-  let main;
+/** HEAD's sha and branch, and the default branch that origin/HEAD names, in one git call. @param {string} root */
+async function readHead(root) {
+  let out;
   try {
-    main = git(root, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD').replace(/^origin\//, '');
-  } catch {
-    throw new Error(`${path.basename(root)} has no origin/HEAD; run: git remote set-head origin --auto`);
+    out = await git(root, 'rev-parse', 'HEAD', '--abbrev-ref', 'HEAD', 'origin/HEAD');
+  } catch (e) {
+    if (/origin\/HEAD/.test(message(e))) throw new Error(`${path.basename(root)} has no origin/HEAD; run: git remote set-head origin --auto`);
+    throw e;
   }
-  return { branch, main };
+  const [sha, branch, origin] = out.split('\n');
+  return { sha, branch, main: origin.replace(/^origin\//, '') };
+}
+
+/**
+ * The cached promise for `key`, made on first use; a rejection is dropped so the next call retries.
+ * @template T @param {Map<string, Promise<T>>} map @param {string} key @param {() => Promise<T>} make
+ */
+function memo(map, key, make) {
+  let p = map.get(key);
+  if (!p) {
+    p = make();
+    map.set(key, p);
+    p.catch(() => map.delete(key));
+  }
+  return p;
 }
 
 /**
