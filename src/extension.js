@@ -10,7 +10,8 @@ const { git, locate } = require('./track');
 /**
  * @typedef {ReturnType<typeof store.open>} Store
  * @typedef {{ root: string, store: Store, id: string }} Ref
- * @typedef {{ text: string, tooltip: string, command?: vscode.Command }} Problem
+ * @typedef {{ state: 'credentials' | 'offMain', message: string }} Problem
+ * @typedef {{ uri: vscode.Uri, line: number, thread: store.Thread }} Listed
  */
 
 const DEFAULT_LOCATION = '~/.line-comments';
@@ -21,9 +22,21 @@ const POLL_MS = 10_000;
 /** @param {vscode.ExtensionContext} context */
 function activate(context) {
   const controller = vscode.comments.createCommentController('line-comments', 'Line Comments');
-  const archivedButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
-  archivedButton.command = 'lineComments.toggleArchived';
-  const notice = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+  /** @type {Listed[]} threads in the side bar, also the ones on screen */
+  let listed = [];
+  /** @type {vscode.EventEmitter<void>} */
+  const treeChanged = new vscode.EventEmitter();
+  /** @type {vscode.TreeDataProvider<string | Listed>} files (by URI string), then their threads */
+  const tree = {
+    onDidChangeTreeData: treeChanged.event,
+    getChildren: (el) => {
+      if (el === undefined) return [...new Set(listed.map((l) => l.uri.toString()))].sort();
+      if (typeof el === 'string') return listed.filter((l) => l.uri.toString() === el).sort((a, b) => a.line - b.line);
+      return [];
+    },
+    getTreeItem: (el) => (typeof el === 'string' ? fileItem(el) : threadItem(el)),
+  };
+  const view = vscode.window.createTreeView('lineComments.threads', { treeDataProvider: tree });
   /** @type {Map<string, Store>} workspace folder -> its store, when configured and on the default branch */
   let active = new Map();
   /** @type {Map<string, Store>} by location, endpoint and repo, so caches survive across syncs */
@@ -63,15 +76,7 @@ function activate(context) {
       const url = new URL(location);
       const prefix = url.pathname.replace(/^\/+|\/+$/g, '');
       const saved = await context.secrets.get(secretKey(endpoint));
-      if (saved === undefined) {
-        return {
-          problem: {
-            text: '$(key) Line Comments: set S3 credentials',
-            tooltip: `Enter the access key for ${endpoint}`,
-            command: { title: 'Set S3 credentials', command: 'lineComments.setS3Credentials' },
-          },
-        };
-      }
+      if (saved === undefined) return { problem: { state: 'credentials', message: `Needs the S3 access key for ${endpoint}.` } };
       const { accessKeyId, secretAccessKey } = JSON.parse(saved);
       const cfg = { endpoint, region, bucket: url.hostname, accessKeyId, secretAccessKey };
       const key = `${location}\0${endpoint}\0${repo}`;
@@ -104,17 +109,17 @@ function activate(context) {
     remote = false;
     for (const root of roots()) {
       try {
-        const { branch, main } = branches(root);
-        if (branch !== main) {
-          problem ??= {
-            text: `$(git-branch) Line Comments: ${main} only`,
-            tooltip: `Comments refer to ${main}'s lines, so they show only while ${path.basename(root)} is on ${main}`,
-          };
-          continue;
-        }
         const found = await storeFor(root);
         if ('problem' in found) {
           problem ??= found.problem;
+          continue;
+        }
+        const { branch, main } = branches(root);
+        if (branch !== main) {
+          problem ??= {
+            state: 'offMain',
+            message: `${path.basename(root)} is on ${branch}. Comments show only on ${main}, because their lines refer to it.`,
+          };
           continue;
         }
         next.set(root, found.store);
@@ -130,6 +135,8 @@ function activate(context) {
     if (changed) controller.commentingRangeProvider = ranges;
 
     const seen = new Set();
+    /** @type {Listed[]} */
+    const nextListed = [];
     let archived = 0;
     for (const [root, s] of active) {
       let loaded;
@@ -139,6 +146,7 @@ function activate(context) {
         failures.push(message(e));
         // An unreachable store keeps what is on screen rather than wiping it.
         for (const [key] of shown) if (key.startsWith(`${keys.get(root)}\0`)) seen.add(key);
+        nextListed.push(...listed.filter((l) => rootOf(l.uri) === root));
         continue;
       }
       for (const item of loaded) {
@@ -150,7 +158,7 @@ function activate(context) {
         if (item.thread.archived && !showArchived) continue;
         const key = `${keys.get(root)}\0${item.id}`;
         seen.add(key);
-        render(key, { root, store: s, id: item.id }, item.thread);
+        nextListed.push(render(key, { root, store: s, id: item.id }, item.thread));
       }
     }
     for (const [key, thread] of shown) {
@@ -164,12 +172,35 @@ function activate(context) {
     for (const f of failures) if (!errors.has(f)) showError(f);
     errors = new Set(failures);
 
-    if (problem) Object.assign(notice, { command: undefined }, problem).show();
-    else notice.hide();
-    archivedButton.text = showArchived ? '$(eye-closed) Hide archived threads' : `$(archive) ${archived} archived`;
-    archivedButton.tooltip = showArchived ? 'Hide archived comment threads' : 'Show archived comment threads';
-    if (active.size > 0 && (archived > 0 || showArchived)) archivedButton.show();
-    else archivedButton.hide();
+    listed = nextListed;
+    treeChanged.fire();
+    const open = listed.filter((l) => !l.thread.archived).length;
+    view.badge = open > 0 ? { value: open, tooltip: `${open} open comment thread${open === 1 ? '' : 's'}` } : undefined;
+    view.description = showArchived ? 'showing archived' : archived > 0 ? `${archived} archived` : undefined;
+    // The credentials state uses the view's welcome content, which carries a button and hides under a message.
+    view.message = problem?.state === 'credentials' ? undefined : problem?.message ?? failures[0];
+    const state = problem?.state ?? (active.size > 0 ? 'ready' : 'none');
+    await vscode.commands.executeCommand('setContext', 'lineComments.state', state);
+  }
+
+  /** @param {string} uri */
+  function fileItem(uri) {
+    const item = new vscode.TreeItem(vscode.Uri.parse(uri), vscode.TreeItemCollapsibleState.Expanded);
+    item.description = true;
+    return item;
+  }
+
+  /** @param {Listed} l */
+  function threadItem(l) {
+    const [first, ...replies] = l.thread.comments;
+    const item = new vscode.TreeItem(first.body.split('\n')[0]);
+    const more = replies.length === 0 ? '' : ` · ${replies.length} repl${replies.length === 1 ? 'y' : 'ies'}`;
+    item.description = `${first.author} · Ln ${l.line + 1}${more}`;
+    item.tooltip = new vscode.MarkdownString(l.thread.comments.map((c) => `**${c.author}:** ${c.body}`).join('\n\n'));
+    item.iconPath = new vscode.ThemeIcon(l.thread.archived ? 'archive' : 'comment-discussion');
+    const at = new vscode.Range(l.line, 0, l.line, 0);
+    item.command = { title: 'Go to thread', command: 'vscode.open', arguments: [l.uri, { selection: at }] };
+    return item;
   }
 
   // One sync at a time; requests that arrive during a sync collapse into one more run.
@@ -222,7 +253,7 @@ function activate(context) {
     resync();
   }
 
-  /** @param {string} key @param {Ref} ref @param {store.Thread} thread */
+  /** @param {string} key @param {Ref} ref @param {store.Thread} thread @returns {Listed} */
   function render(key, ref, thread) {
     const now = locate(ref.root, thread);
     const uri = vscode.Uri.file(path.join(ref.root, now.path));
@@ -255,6 +286,7 @@ function activate(context) {
     t.label = [thread.archived && 'Archived', count, now.stale && `line since changed from: ${thread.text.trim()}`]
       .filter(Boolean)
       .join(' · ');
+    return { uri, line: now.line, thread };
   }
 
   /** @param {vscode.CommentReply} reply */
@@ -336,8 +368,8 @@ function activate(context) {
 
   context.subscriptions.push(
     controller,
-    archivedButton,
-    notice,
+    view,
+    treeChanged,
     { dispose: () => watchers.forEach((w) => w.dispose()) },
     { dispose: () => clearTimeout(pending) },
     { dispose: () => clearInterval(poll) },
@@ -351,6 +383,7 @@ function activate(context) {
     vscode.commands.registerCommand('lineComments.delete', guard(remove)),
     vscode.commands.registerCommand('lineComments.toggleArchived', guard(toggleArchived)),
     vscode.commands.registerCommand('lineComments.setS3Credentials', guard(setS3Credentials)),
+    vscode.commands.registerCommand('lineComments.refresh', guard(sync)),
   );
   rewatch();
 }

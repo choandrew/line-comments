@@ -28,7 +28,7 @@ One user-level setting covers every repo: each repo's threads go under
 }
 ```
 
-Then run **Line Comments: Set S3 Credentials** (the status bar offers it). The key is kept in VS
+Then click **Set S3 Credentials** in the Line Comments side bar. The key is kept in VS
 Code's secret storage, never in settings. S3 has no change notifications, so new comments from
 others appear within 10 seconds.
 
@@ -39,11 +39,14 @@ Left unset, `lineComments.location` is `~/.line-comments`: comments stay on your
 
 ## Use
 
+- **Side bar:** the Line Comments icon in the Activity Bar lists every thread by file, with a
+  badge counting open threads; click one to jump to its line. The panel also says why nothing
+  shows (off `main`, no S3 key yet).
 - **Comment:** hover the gutter next to a line and click `+`.
 - **Reply:** anyone can add to any thread.
 - **Archive:** the archive button hides a thread; **Unarchive** brings it back.
 - **Delete:** the trash button removes a thread and all its comments, after a confirmation.
-- **See archived threads:** click `N archived` in the status bar, or run
+- **See archived threads:** the archive button in the side bar's title, or
   **Line Comments: Show/Hide Archived Threads**.
 
 Comments show only while the repo is on its default branch (the one `origin/HEAD` names, usually
