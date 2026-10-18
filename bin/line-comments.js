@@ -12,6 +12,7 @@ const { repoId } = require('../src/repo');
 
 const USAGE = 'usage: line-comments open [--location <folder or s3://bucket/prefix>] [--endpoint <s3 url>]';
 const DEFAULT_LOCATION = '~/.line-comments';
+const EDITORS = ['Code', 'Cursor'];
 
 /** @param {string[]} argv @returns {Promise<number>} exit code */
 async function main(argv) {
@@ -21,17 +22,25 @@ async function main(argv) {
   }
   const { values: flags } = parseArgs({ args: argv.slice(1), options: { location: { type: 'string' }, endpoint: { type: 'string' } } });
   const root = await git(process.cwd(), 'rev-parse', '--show-toplevel');
-  const files = [path.join(root, '.vscode', 'settings.json'), userSettings()];
-  /** First of the given value and the settings files, in that order. @param {string} key @param {string | undefined} given */
+  const repoSettings = path.join(root, '.vscode', 'settings.json');
+  /**
+   * The given value, else the repo's settings, else the user settings of VS Code and Cursor, which must agree.
+   * @param {string} key @param {string | undefined} given
+   */
   const setting = (key, given) => {
     if (given !== undefined) return given;
-    for (const file of files) {
+    const read = (/** @type {string} */ file) => {
       const value = fs.existsSync(file) ? jsonc(file)[`lineComments.${key}`] : undefined;
-      if (value === undefined) continue;
-      if (typeof value !== 'string' || value === '') throw new Error(`${file}: lineComments.${key} must be a non-empty string`);
-      return value;
+      if (value !== undefined && (typeof value !== 'string' || value === '')) throw new Error(`${file}: lineComments.${key} must be a non-empty string`);
+      return value === undefined ? [] : [{ file, value }];
+    };
+    const [repo] = read(repoSettings);
+    if (repo) return repo.value;
+    const user = EDITORS.flatMap((editor) => read(userSettings(editor)));
+    if (new Set(user.map((u) => u.value)).size > 1) {
+      throw new Error(`lineComments.${key} differs between ${user.map((u) => u.file).join(' and ')}; pass it as a flag`);
     }
-    return undefined;
+    return user[0]?.value;
   };
 
   let out;
@@ -92,8 +101,9 @@ function show(c, pad, mark) {
   return [`[${c.author}] ${head}${mark}`, ...more.map((l) => pad + l)].join('\n');
 }
 
-function userSettings() {
-  const rel = ['Code', 'User', 'settings.json'];
+/** @param {string} editor its folder under the OS's app-data folder */
+function userSettings(editor) {
+  const rel = [editor, 'User', 'settings.json'];
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', ...rel);
   if (process.platform === 'win32') return path.join(/** @type {string} */ (process.env.APPDATA), ...rel);
   return path.join(os.homedir(), '.config', ...rel);

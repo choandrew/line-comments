@@ -38,7 +38,7 @@ function commit(root) {
 }
 
 /** @param {string} root @param {NodeJS.ProcessEnv} env */
-const run = (root, env) => execFileSync(process.execPath, [CLI, 'open'], { cwd: root, encoding: 'utf8', env });
+const run = (root, env) => execFileSync(process.execPath, [CLI, 'open'], { cwd: root, encoding: 'utf8', env, stdio: 'pipe' });
 
 /** @param {string} author @param {string} body @param {number} minute */
 const by = (author, body, minute) => ({ author, body, at: `2026-01-01T10:0${minute}:00.000Z` });
@@ -85,4 +85,25 @@ test('the location comes from the repo settings file, which may hold comments an
   const env = { ...process.env };
   delete env.LINE_COMMENTS_LOCATION;
   assert.equal(run(root, env), 'src/app.py:3: [Ada] Hi\n');
+});
+
+test("the location comes from Cursor's user settings, and VS Code and Cursor disagreeing is an error", async () => {
+  // Catches: a Cursor-only user's settings being ignored, or the CLI silently picking one of two different stores.
+  const { root, commit: c } = clone();
+  const dir = tmp();
+  await store.open(blob.folder(dir), 'owner/proj/').create({ path: 'src/app.py', line: 3, text: '    return total', commit: c }, by('Ada', 'Hi', 0));
+  const home = tmp();
+  /** @param {string} editor @param {string} location */
+  const settle = (editor, location) => {
+    const user = path.join(home, ...(process.platform === 'darwin' ? ['Library', 'Application Support'] : ['.config']), editor, 'User');
+    fs.mkdirSync(user, { recursive: true });
+    fs.writeFileSync(path.join(user, 'settings.json'), JSON.stringify({ 'lineComments.location': location }));
+  };
+  /** @type {NodeJS.ProcessEnv} */
+  const env = { ...process.env, HOME: home };
+  delete env.LINE_COMMENTS_LOCATION;
+  settle('Cursor', dir);
+  assert.equal(run(root, env), 'src/app.py:3: [Ada] Hi\n');
+  settle('Code', tmp());
+  assert.throws(() => run(root, env), /lineComments\.location differs between/);
 });

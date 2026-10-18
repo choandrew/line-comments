@@ -1,6 +1,6 @@
 # Line Comments
 
-Comment threads on any line of code in VS Code, outside pull requests. Threads are stored in S3
+Comment threads on any line of code in VS Code or Cursor, outside pull requests. Threads are stored in S3
 (e.g. SeaweedFS) or a shared folder, so your team and coding agents see the same comments.
 
 ## Install
@@ -9,9 +9,11 @@ Comment threads on any line of code in VS Code, outside pull requests. Threads a
 curl -fsSLO https://github.com/choandrew/line-comments/releases/latest/download/line-comments.vsix && code --install-extension line-comments.vsix
 ```
 
+In Cursor, replace `code` with `cursor`.
+
 ## Set up
 
-In your user settings:
+In your VS Code or Cursor user settings:
 
 ```json
 {
