@@ -1,9 +1,9 @@
 {
   "name": "line-comments",
   "displayName": "Line Comments",
-  "description": "GitHub-style line comment threads in VS Code, outside any pull request, stored as files in your repo.",
+  "description": "GitHub-style line comment threads in VS Code, outside any pull request, shared through a folder or an S3 bucket such as SeaweedFS.",
   "publisher": "choandrew",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -35,10 +35,22 @@
     "configuration": {
       "title": "Line Comments",
       "properties": {
-        "lineComments.folder": {
+        "lineComments.location": {
+          "type": "string",
+          "default": "~/.line-comments",
+          "scope": "resource",
+          "markdownDescription": "Where comment threads live: a folder (`~` and paths relative to the workspace folder work), or an S3 location such as `s3://bucket/prefix`. Each repo's threads go under `<location>/<owner>/<repo>/`, so one location serves every repo."
+        },
+        "lineComments.s3.endpoint": {
           "type": "string",
           "scope": "resource",
-          "markdownDescription": "Folder that holds this repo's comment threads. Point everyone at the same shared folder (Dropbox, Google Drive, OneDrive, a network share) to see each other's comments live. `~` and paths relative to the workspace folder work. Use one folder per repo."
+          "markdownDescription": "S3 endpoint URL for an `s3://` location, e.g. `http://seaweedfs:8333` or `https://s3.us-east-1.amazonaws.com`. Set the access key with **Line Comments: Set S3 Credentials**."
+        },
+        "lineComments.s3.region": {
+          "type": "string",
+          "default": "us-east-1",
+          "scope": "resource",
+          "markdownDescription": "S3 signing region. SeaweedFS and MinIO accept any value."
         }
       }
     },
@@ -67,6 +79,11 @@
         "title": "Show/Hide Archived Threads",
         "category": "Line Comments",
         "icon": "$(archive)"
+      },
+      {
+        "command": "lineComments.setS3Credentials",
+        "title": "Set S3 Credentials",
+        "category": "Line Comments"
       }
     ],
     "menus": {

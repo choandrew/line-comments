@@ -3,10 +3,20 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const blob = require('./blob');
 const store = require('./store');
 const { git, locate } = require('./track');
 
-/** @typedef {{ root: string, dir: string, id: string }} Ref */
+/**
+ * @typedef {ReturnType<typeof store.open>} Store
+ * @typedef {{ root: string, store: Store, id: string }} Ref
+ * @typedef {{ text: string, tooltip: string, command?: vscode.Command }} Problem
+ */
+
+const DEFAULT_LOCATION = '~/.line-comments';
+// shortcut: S3 has no change notifications, so remote locations are polled; upgrade to SeaweedFS's
+// filer subscription if 10 s feels slow.
+const POLL_MS = 10_000;
 
 /** @param {vscode.ExtensionContext} context */
 function activate(context) {
@@ -14,9 +24,11 @@ function activate(context) {
   const archivedButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   archivedButton.command = 'lineComments.toggleArchived';
   const notice = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
-  /** @type {Map<string, string>} workspace folder -> comment folder, when configured and on the default branch */
+  /** @type {Map<string, Store>} workspace folder -> its store, when configured and on the default branch */
   let active = new Map();
-  /** @type {Map<string, vscode.CommentThread>} keyed by thread directory */
+  /** @type {Map<string, Store>} by location, endpoint and repo, so caches survive across syncs */
+  const stores = new Map();
+  /** @type {Map<string, vscode.CommentThread>} keyed by store key and thread id */
   const shown = new Map();
   /** @type {Map<vscode.CommentThread, Ref>} */
   const refs = new Map();
@@ -25,63 +37,120 @@ function activate(context) {
   /** @type {Set<string>} */
   let errors = new Set();
   let showArchived = false;
+  let remote = false;
 
-  controller.commentingRangeProvider = {
+  /** @type {vscode.CommentingRangeProvider} */
+  const ranges = {
     provideCommentingRanges: (doc) => {
       const root = rootOf(doc.uri);
-      const dir = root === undefined ? undefined : active.get(root);
-      if (dir === undefined || doc.uri.fsPath.startsWith(dir + path.sep)) return [];
+      if (root === undefined || !active.has(root)) return [];
       return [new vscode.Range(0, 0, doc.lineCount - 1, 0)];
     },
   };
+  controller.commentingRangeProvider = ranges;
+
+  /**
+   * The store for a workspace folder, or the problem stopping one.
+   * @param {string} root @returns {Promise<{ store: Store, key: string, remote: boolean } | { problem: Problem }>}
+   */
+  async function storeFor(root) {
+    const config = vscode.workspace.getConfiguration('lineComments', vscode.Uri.file(root));
+    const location = setting(config, 'location');
+    const repo = repoId(root);
+    if (location.startsWith('s3://')) {
+      const endpoint = setting(config, 's3.endpoint');
+      const region = setting(config, 's3.region');
+      const url = new URL(location);
+      const prefix = url.pathname.replace(/^\/+|\/+$/g, '');
+      const saved = await context.secrets.get(secretKey(endpoint));
+      if (saved === undefined) {
+        return {
+          problem: {
+            text: '$(key) Line Comments: set S3 credentials',
+            tooltip: `Enter the access key for ${endpoint}`,
+            command: { title: 'Set S3 credentials', command: 'lineComments.setS3Credentials' },
+          },
+        };
+      }
+      const { accessKeyId, secretAccessKey } = JSON.parse(saved);
+      const cfg = { endpoint, region, bucket: url.hostname, accessKeyId, secretAccessKey };
+      const key = `${location}\0${endpoint}\0${repo}`;
+      return { store: cached(key, () => blob.bucket(cfg, prefix ? `${prefix}/` : ''), repo), key, remote: true };
+    }
+    const dir = expand(root, location);
+    if (location === DEFAULT_LOCATION) fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`lineComments.location ${dir} is not a folder`);
+    const key = `${dir}\0\0${repo}`;
+    return { store: cached(key, () => blob.folder(dir), repo), key, remote: false };
+  }
+
+  /** @param {string} key @param {() => blob.Blob} make @param {string} repo */
+  function cached(key, make, repo) {
+    let s = stores.get(key);
+    if (!s) stores.set(key, (s = store.open(make(), `${repo}/`)));
+    return s;
+  }
 
   /** Re-reads config, branches and every thread, then updates what VS Code shows. */
-  function sync() {
+  async function syncOnce() {
     /** @type {string[]} */
     const failures = [];
-    /** @type {{ text: string, tooltip: string, command?: vscode.Command } | undefined} */
+    /** @type {Problem | undefined} */
     let problem;
-    active = new Map();
+    /** @type {Map<string, Store>} */
+    const next = new Map();
+    /** @type {Map<string, string>} */
+    const keys = new Map();
+    remote = false;
     for (const root of roots()) {
       try {
-        const dir = folderOf(root);
-        if (dir === undefined) {
-          problem ??= {
-            text: '$(warning) Line Comments: set a folder',
-            tooltip: 'Choose the shared folder that holds comment threads (lineComments.folder)',
-            command: { title: 'Open settings', command: 'workbench.action.openSettings', arguments: ['lineComments.folder'] },
-          };
-          continue;
-        }
         const { branch, main } = branches(root);
         if (branch !== main) {
           problem ??= {
             text: `$(git-branch) Line Comments: ${main} only`,
             tooltip: `Comments refer to ${main}'s lines, so they show only while ${path.basename(root)} is on ${main}`,
-            command: undefined,
           };
           continue;
         }
-        active.set(root, dir);
+        const found = await storeFor(root);
+        if ('problem' in found) {
+          problem ??= found.problem;
+          continue;
+        }
+        next.set(root, found.store);
+        keys.set(root, found.key);
+        remote ||= found.remote;
       } catch (e) {
         failures.push(message(e));
       }
     }
+    const changed = next.size !== active.size || [...next.keys()].some((r) => !active.has(r));
+    active = next;
+    // VS Code caches commenting ranges per editor; assigning the provider again makes it re-ask.
+    if (changed) controller.commentingRangeProvider = ranges;
 
     const seen = new Set();
     let archived = 0;
-    for (const [root, dir] of active) {
-      for (const id of store.list(dir)) {
-        try {
-          const thread = store.read(dir, id);
-          if (thread.archived) archived++;
-          if (thread.archived && !showArchived) continue;
-          const key = path.join(dir, id);
-          seen.add(key);
-          render(key, { root, dir, id }, thread);
-        } catch (e) {
-          failures.push(message(e));
+    for (const [root, s] of active) {
+      let loaded;
+      try {
+        loaded = await s.readAll();
+      } catch (e) {
+        failures.push(message(e));
+        // An unreachable store keeps what is on screen rather than wiping it.
+        for (const [key] of shown) if (key.startsWith(`${keys.get(root)}\0`)) seen.add(key);
+        continue;
+      }
+      for (const item of loaded) {
+        if ('error' in item) {
+          failures.push(item.error);
+          continue;
         }
+        if (item.thread.archived) archived++;
+        if (item.thread.archived && !showArchived) continue;
+        const key = `${keys.get(root)}\0${item.id}`;
+        seen.add(key);
+        render(key, { root, store: s, id: item.id }, item.thread);
       }
     }
     for (const [key, thread] of shown) {
@@ -91,11 +160,11 @@ function activate(context) {
       refs.delete(thread);
     }
 
-    // Each distinct problem notifies once, not on every file event while it persists.
+    // Each distinct problem notifies once, not on every sync while it persists.
     for (const f of failures) if (!errors.has(f)) showError(f);
     errors = new Set(failures);
 
-    if (problem) Object.assign(notice, problem).show();
+    if (problem) Object.assign(notice, { command: undefined }, problem).show();
     else notice.hide();
     archivedButton.text = showArchived ? '$(eye-closed) Hide archived threads' : `$(archive) ${archived} archived`;
     archivedButton.tooltip = showArchived ? 'Hide archived comment threads' : 'Show archived comment threads';
@@ -103,10 +172,38 @@ function activate(context) {
     else archivedButton.hide();
   }
 
-  /** Watches each comment folder (which may sit outside the workspace) and each repo's HEAD and reflog. */
+  // One sync at a time; requests that arrive during a sync collapse into one more run.
+  let syncing = false;
+  let again = false;
+  async function sync() {
+    if (syncing) {
+      again = true;
+      return;
+    }
+    syncing = true;
+    try {
+      do {
+        again = false;
+        await syncOnce();
+      } while (again);
+    } finally {
+      syncing = false;
+    }
+  }
+
+  /** @type {NodeJS.Timeout | undefined} */
+  let pending;
+  // A pull or checkout fires many file events at once; sync once they settle.
+  const resync = () => {
+    clearTimeout(pending);
+    pending = setTimeout(guard(sync), 150);
+  };
+
+  /** Watches each repo's HEAD and reflog, and each comment folder on disk. */
   function rewatch() {
     for (const w of watchers) w.dispose();
     watchers = [];
+    stores.clear();
     /** @param {string} base @param {string} glob */
     const watch = (base, glob) => {
       const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(base), glob));
@@ -115,12 +212,11 @@ function activate(context) {
     for (const root of roots()) {
       try {
         // logs/HEAD gains a line on every checkout, commit, pull or reset, so it catches main moving.
-        const gitDir = git(root, 'rev-parse', '--path-format=absolute', '--git-dir');
-        watch(gitDir, '{HEAD,logs/HEAD}');
-        const dir = folderOf(root);
-        if (dir !== undefined) watch(dir, '**/*.json');
+        watch(git(root, 'rev-parse', '--path-format=absolute', '--git-dir'), '{HEAD,logs/HEAD}');
+        const location = setting(vscode.workspace.getConfiguration('lineComments', vscode.Uri.file(root)), 'location');
+        if (!location.startsWith('s3://')) watch(path.join(expand(root, location), ...repoId(root).split('/')), '**/*.json');
       } catch {
-        // sync() reports the same failure.
+        // syncOnce() reports the same failure.
       }
     }
     resync();
@@ -144,8 +240,8 @@ function activate(context) {
         ? vscode.CommentThreadCollapsibleState.Collapsed
         : vscode.CommentThreadCollapsibleState.Expanded;
       shown.set(key, t);
-      refs.set(t, ref);
     }
+    refs.set(t, ref);
     t.range = range;
     t.comments = thread.comments.map((c) => ({
       body: new vscode.MarkdownString(c.body),
@@ -164,8 +260,8 @@ function activate(context) {
   /** @param {vscode.CommentReply} reply */
   async function comment({ thread, text }) {
     const root = rootOf(thread.uri);
-    const dir = root === undefined ? undefined : active.get(root);
-    if (root === undefined || dir === undefined) throw new Error('commenting is off here; see the status bar');
+    const s = root === undefined ? undefined : active.get(root);
+    if (root === undefined || s === undefined) throw new Error('commenting is off here; see the status bar');
     let author;
     try {
       author = git(root, 'config', 'user.name');
@@ -176,23 +272,23 @@ function activate(context) {
     const entry = { author, body: text, at: new Date().toISOString() };
     const ref = refs.get(thread);
     if (ref) {
-      store.reply(ref.dir, ref.id, entry);
+      await ref.store.reply(ref.id, entry);
     } else {
       const doc = await vscode.workspace.openTextDocument(thread.uri);
       const line = thread.range.start.line;
       const rel = path.relative(root, thread.uri.fsPath).split(path.sep).join('/');
       const commit = git(root, 'rev-parse', 'HEAD');
-      store.create(dir, { path: rel, line: line + 1, text: doc.lineAt(line).text, commit }, entry);
+      await s.create({ path: rel, line: line + 1, text: doc.lineAt(line).text, commit }, entry);
       thread.dispose();
     }
-    sync();
+    await sync();
   }
 
-  /** @param {boolean} archived @returns {(thread: vscode.CommentThread) => void} */
-  const archive = (archived) => (thread) => {
-    const { dir, id } = ref(thread);
-    store.setArchived(dir, id, archived);
-    sync();
+  /** @param {boolean} archived @returns {(thread: vscode.CommentThread) => Promise<void>} */
+  const archive = (archived) => async (thread) => {
+    const r = ref(thread);
+    await r.store.setArchived(r.id, archived);
+    await sync();
   };
 
   /** @param {vscode.CommentThread} thread */
@@ -203,14 +299,30 @@ function activate(context) {
       'Delete',
     );
     if (choice !== 'Delete') return;
-    const { dir, id } = ref(thread);
-    store.remove(dir, id);
-    sync();
+    const r = ref(thread);
+    await r.store.remove(r.id);
+    await sync();
   }
 
-  function toggleArchived() {
+  async function toggleArchived() {
     showArchived = !showArchived;
-    sync();
+    await sync();
+  }
+
+  async function setS3Credentials() {
+    const config = (/** @type {string} */ r) => vscode.workspace.getConfiguration('lineComments', vscode.Uri.file(r));
+    const root = roots().find((r) => setting(config(r), 'location').startsWith('s3://'));
+    if (root === undefined) throw new Error('set lineComments.location to an s3:// URL first');
+    const endpoint = setting(config(root), 's3.endpoint');
+    const accessKeyId = await vscode.window.showInputBox({ title: `S3 access key ID for ${endpoint}`, ignoreFocusOut: true });
+    if (!accessKeyId) return;
+    const secretAccessKey = await vscode.window.showInputBox({
+      title: `S3 secret access key for ${endpoint}`,
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (!secretAccessKey) return;
+    await context.secrets.store(secretKey(endpoint), JSON.stringify({ accessKeyId, secretAccessKey }));
   }
 
   /** @param {vscode.CommentThread} thread @returns {Ref} */
@@ -220,13 +332,7 @@ function activate(context) {
     return r;
   }
 
-  /** @type {NodeJS.Timeout | undefined} */
-  let pending;
-  // A pull or checkout fires many file events at once; sync once they settle.
-  const resync = () => {
-    clearTimeout(pending);
-    pending = setTimeout(guard(sync), 150);
-  };
+  const poll = setInterval(() => remote && resync(), POLL_MS);
 
   context.subscriptions.push(
     controller,
@@ -234,14 +340,17 @@ function activate(context) {
     notice,
     { dispose: () => watchers.forEach((w) => w.dispose()) },
     { dispose: () => clearTimeout(pending) },
+    { dispose: () => clearInterval(poll) },
     vscode.workspace.onDidSaveTextDocument(resync),
     vscode.workspace.onDidChangeWorkspaceFolders(rewatch),
-    vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration('lineComments.folder') && rewatch()),
+    vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration('lineComments') && rewatch()),
+    context.secrets.onDidChange(rewatch),
     vscode.commands.registerCommand('lineComments.comment', guard(comment)),
     vscode.commands.registerCommand('lineComments.archive', guard(archive(true))),
     vscode.commands.registerCommand('lineComments.unarchive', guard(archive(false))),
     vscode.commands.registerCommand('lineComments.delete', guard(remove)),
     vscode.commands.registerCommand('lineComments.toggleArchived', guard(toggleArchived)),
+    vscode.commands.registerCommand('lineComments.setS3Credentials', guard(setS3Credentials)),
   );
   rewatch();
 }
@@ -257,19 +366,32 @@ function rootOf(uri) {
   return folder?.uri.scheme === 'file' ? folder.uri.fsPath : undefined;
 }
 
-/**
- * The configured comment folder for a workspace folder, or undefined when unset. `~` and paths
- * relative to the workspace folder are allowed; a folder that does not exist is an error.
- * @param {string} root @returns {string | undefined}
- */
-function folderOf(root) {
-  const setting = vscode.workspace.getConfiguration('lineComments', vscode.Uri.file(root)).get('folder');
-  if (setting === undefined || setting === '') return undefined;
-  if (typeof setting !== 'string') throw new Error('lineComments.folder must be a string');
-  const dir = path.resolve(root, setting.replace(/^~(?=$|[\\/])/, os.homedir()));
-  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`lineComments.folder ${dir} is not a folder`);
-  return dir;
+/** A required string setting. @param {vscode.WorkspaceConfiguration} config @param {string} name */
+function setting(config, name) {
+  const value = config.get(name);
+  if (typeof value !== 'string' || value === '') throw new Error(`set lineComments.${name}`);
+  return value;
 }
+
+/** `~` and paths relative to the workspace folder. @param {string} root @param {string} location */
+function expand(root, location) {
+  return path.resolve(root, location.replace(/^~(?=$|[\\/])/, os.homedir()));
+}
+
+/** The repo's `owner/name` from its origin URL; it keys the repo's threads in a shared location. @param {string} root */
+function repoId(root) {
+  const url = git(root, 'remote', 'get-url', 'origin');
+  // https://host/owner/repo, git@host:owner/repo, or a local path, which may hold `..`.
+  const tail = url.replace(/^[\w+.-]+:\/\/[^/]*/, '').replace(/^[^/@]+@[^:]+:/, '').replace(/(\.git)?\/*$/, '');
+  const parts = path.posix.normalize(`/${tail}`).split('/').filter(Boolean).slice(-2);
+  if (parts.length !== 2 || !parts.every((p) => /^[\w.-]+$/.test(p) && p !== '.' && p !== '..')) {
+    throw new Error(`cannot tell owner/repo from origin ${url}`);
+  }
+  return parts.join('/');
+}
+
+/** @param {string} endpoint */
+const secretKey = (endpoint) => `s3:${endpoint}`;
 
 /** The checked-out branch and the default branch that origin/HEAD names. @param {string} root */
 function branches(root) {

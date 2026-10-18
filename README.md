@@ -1,9 +1,9 @@
 # Line Comments
 
 GitHub-style comment threads on any line of code in VS Code, without a pull request. Threads live
-in a folder you choose, such as a Dropbox, Google Drive, OneDrive or network-share folder, so
-everyone pointed at it sees new comments as they sync. Coding agents (Claude Code, Codex) can read
-the same files.
+outside the repo: in an S3 bucket (AWS, SeaweedFS, MinIO) or a shared folder (Dropbox, Google
+Drive, a network share), so everyone pointed at the same place sees each other's comments. Coding
+agents (Claude Code, Codex) can read the same files.
 
 ## Install
 
@@ -16,15 +16,26 @@ and run **Extensions: Install from VSIX…** in VS Code.
 
 ## Set up
 
-Set `lineComments.folder` to the shared folder for this repo, in your user settings or the repo's
-`.vscode/settings.json`:
+One user-level setting covers every repo: each repo's threads go under
+`<location>/<owner>/<repo>/`, named from its `origin` remote.
+
+**Shared through S3** (SeaweedFS shown):
 
 ```json
-{ "lineComments.folder": "~/Dropbox/reviews/my-repo" }
+{
+  "lineComments.location": "s3://trading/line-comments",
+  "lineComments.s3.endpoint": "http://seaweedfs.example:8333"
+}
 ```
 
-`~` and paths relative to the workspace folder work. Use one folder per repo. Until it is set,
-the status bar shows **Line Comments: set a folder**.
+Then run **Line Comments: Set S3 Credentials** (the status bar offers it). The key is kept in VS
+Code's secret storage, never in settings. S3 has no change notifications, so new comments from
+others appear within 10 seconds.
+
+**Shared through a folder:** set `lineComments.location` to it, e.g.
+`~/Library/CloudStorage/Dropbox/line-comments`. Changes appear as the folder syncs.
+
+Left unset, `lineComments.location` is `~/.line-comments`: comments stay on your machine.
 
 ## Use
 
@@ -37,6 +48,7 @@ the status bar shows **Line Comments: set a folder**.
 
 Comments show only while the repo is on its default branch (the one `origin/HEAD` names, usually
 `main`), because their line numbers refer to that branch. Your name comes from `git config user.name`.
+Workspaces in Restricted Mode get no comments, since the extension runs git there.
 
 ## Lines follow the code
 
@@ -53,23 +65,28 @@ out), the extension replays `git diff` from that commit to the working tree:
 ## Storage format
 
 ```
-<folder>/<thread-id>/thread.json       {"path": "src/app.py", "line": 42, "text": "the line when commented",
-                                        "commit": "<sha the comment was written on>", "archived": false}
-<folder>/<thread-id>/<comment-id>.json {"author": "Ada", "body": "Markdown text", "at": "2026-10-17T18:03:00.000Z"}
+<location>/<owner>/<repo>/<thread-id>/thread.json
+    {"path": "src/app.py", "line": 42, "text": "the line when commented",
+     "commit": "<sha the comment was written on>", "archived": false}
+<location>/<owner>/<repo>/<thread-id>/<comment-id>.json
+    {"author": "Ada", "body": "Markdown text", "at": "2026-10-17T18:03:00.000Z"}
 ```
 
 - `path` is relative to the repo root; `line` is 1-based and refers to `commit`.
-- Each comment is its own file, so two people replying at once never conflict in a sync service.
+- Each comment is its own file, so two people replying at once never conflict.
 - Comments are ordered by `at` (ISO 8601).
 
 To point an agent at the comments, add a line like this to the repo's `AGENTS.md` or `CLAUDE.md`:
 
-> Line review comments live in `~/Dropbox/reviews/my-repo`; the format is at https://github.com/choandrew/line-comments#storage-format.
+> Line review comments live in `s3://trading/line-comments/<owner>/<repo>/`; the format is at https://github.com/choandrew/line-comments#storage-format.
 
 ## Develop
 
 ```bash
 npm ci && npm run check
 ```
+
+`npm run check` also runs the store tests against S3 when `LINE_COMMENTS_TEST_S3` names a bucket,
+e.g. `http://test-key:test-secret@localhost:18333/test`; CI starts a SeaweedFS for this.
 
 Push a `v*` tag to build and publish a release.
