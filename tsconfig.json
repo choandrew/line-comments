@@ -8,5 +8,5 @@
     "target": "es2022",
     "types": ["node", "vscode"]
   },
-  "include": ["src", "test"]
+  "include": ["bin", "src", "test"]
 }
