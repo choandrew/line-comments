@@ -5,7 +5,8 @@ const crypto = require('crypto');
 
 /**
  * @typedef {import('./blob').Blob} Blob
- * @typedef {{ author: string, body: string, at: string }} Comment
+ * @typedef {{ author: string, body: string, at: string, edited?: string }} Written what a comment file holds
+ * @typedef {Written & { id: string }} Comment `id` is the file's name
  * @typedef {{ path: string, line: number, text: string, commit: string, archived: boolean }} Anchor
  * @typedef {Anchor & { comments: Comment[] }} Thread
  * @typedef {{ id: string, thread: Thread } | { id: string, error: string }} Loaded
@@ -63,14 +64,17 @@ function open(blob, base) {
     const comments = await Promise.all(
       [...names]
         .filter(([name]) => name !== THREAD)
-        .map(async ([name, version]) => parseComment(await load(`${id}/${name}`, version), `${base}${id}/${name}`)),
+        .map(async ([name, version]) => ({
+          id: name.slice(0, -'.json'.length),
+          ...parseComment(await load(`${id}/${name}`, version), `${base}${id}/${name}`),
+        })),
     );
     if (comments.length === 0) throw new Error(`${base}${id} has no comments`);
     comments.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
     return { ...anchor, comments };
   }
 
-  /** @param {Omit<Anchor, 'archived'>} anchor @param {Comment} first @returns {Promise<string>} */
+  /** @param {Omit<Anchor, 'archived'>} anchor @param {Written} first @returns {Promise<string>} */
   async function create(anchor, first) {
     const id = crypto.randomUUID();
     // The comment goes first: readers only see a thread once thread.json exists.
@@ -79,8 +83,21 @@ function open(blob, base) {
     return id;
   }
 
-  /** @param {string} id @param {Comment} comment */
+  /** @param {string} id @param {Written} comment */
   const reply = (id, comment) => put(`${id}/${crypto.randomUUID()}.json`, comment);
+
+  /**
+   * Rewrites one comment's body; only its own file changes, so it can't conflict with replies.
+   * @param {string} id @param {string} commentId @param {string} body @param {string} at
+   */
+  async function editComment(id, commentId, body, at) {
+    const key = `${id}/${commentId}.json`;
+    const old = parseComment(JSON.parse(await blob.get(base + key)), base + key);
+    await put(key, { ...old, body, edited: at });
+  }
+
+  /** @param {string} id @param {string} commentId */
+  const removeComment = (id, commentId) => blob.del(`${base}${id}/${commentId}.json`);
 
   /** @param {string} id @param {boolean} archived */
   async function setArchived(id, archived) {
@@ -99,7 +116,7 @@ function open(blob, base) {
   /** @param {string} key @param {unknown} value */
   const put = (key, value) => blob.put(base + key, JSON.stringify(value, null, 2) + '\n');
 
-  return { readAll, create, reply, setArchived, remove };
+  return { readAll, create, reply, editComment, removeComment, setArchived, remove };
 }
 
 /** @param {any} v @param {string} file @returns {Anchor} */
@@ -113,11 +130,12 @@ function parseAnchor(v, file) {
   return { path: p, line: v.line, text: v.text, commit: v.commit, archived: v.archived };
 }
 
-/** @param {any} v @param {string} file @returns {Comment} */
+/** @param {any} v @param {string} file @returns {Written} */
 function parseComment(v, file) {
   for (const field of ['author', 'body', 'at']) if (typeof v?.[field] !== 'string' || v[field] === '') bad(file, field);
   if (Number.isNaN(Date.parse(v.at))) bad(file, 'at');
-  return { author: v.author, body: v.body, at: v.at };
+  if (v.edited !== undefined && (typeof v.edited !== 'string' || Number.isNaN(Date.parse(v.edited)))) bad(file, 'edited');
+  return v.edited === undefined ? { author: v.author, body: v.body, at: v.at } : { author: v.author, body: v.body, at: v.at, edited: v.edited };
 }
 
 /** @param {string} file @param {string} field @returns {never} */

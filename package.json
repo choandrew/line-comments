@@ -135,6 +135,30 @@
         "command": "lineComments.switchToDefault",
         "title": "Switch to Default Branch",
         "category": "Line Comments"
+      },
+      {
+        "command": "lineComments.editComment",
+        "title": "Edit",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "lineComments.saveComment",
+        "title": "Save"
+      },
+      {
+        "command": "lineComments.cancelEdit",
+        "title": "Cancel"
+      },
+      {
+        "command": "lineComments.deleteComment",
+        "title": "Delete Comment",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "lineComments.markAllRead",
+        "title": "Mark All as Read",
+        "category": "Line Comments",
+        "icon": "$(check-all)"
       }
     ],
     "menus": {
@@ -153,6 +177,22 @@
         },
         {
           "command": "lineComments.delete",
+          "when": "false"
+        },
+        {
+          "command": "lineComments.editComment",
+          "when": "false"
+        },
+        {
+          "command": "lineComments.saveComment",
+          "when": "false"
+        },
+        {
+          "command": "lineComments.cancelEdit",
+          "when": "false"
+        },
+        {
+          "command": "lineComments.deleteComment",
           "when": "false"
         }
       ],
@@ -182,6 +222,11 @@
       ],
       "view/title": [
         {
+          "command": "lineComments.markAllRead",
+          "group": "navigation@0",
+          "when": "view == lineComments.threads"
+        },
+        {
           "command": "lineComments.toggleArchived",
           "group": "navigation@1",
           "when": "view == lineComments.threads"
@@ -195,6 +240,30 @@
           "command": "lineComments.setS3Credentials",
           "group": "settings",
           "when": "view == lineComments.threads"
+        }
+      ],
+      "comments/comment/title": [
+        {
+          "command": "lineComments.editComment",
+          "group": "inline@1",
+          "when": "commentController == line-comments && comment == mine"
+        },
+        {
+          "command": "lineComments.deleteComment",
+          "group": "inline@2",
+          "when": "commentController == line-comments && comment == mine"
+        }
+      ],
+      "comments/comment/context": [
+        {
+          "command": "lineComments.cancelEdit",
+          "group": "inline@2",
+          "when": "commentController == line-comments && comment == mine"
+        },
+        {
+          "command": "lineComments.saveComment",
+          "group": "inline@1",
+          "when": "commentController == line-comments && comment == mine"
         }
       ]
     }

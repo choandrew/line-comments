@@ -12,7 +12,8 @@ const { git, tracker } = require('./track');
  * @typedef {ReturnType<typeof store.open>} Store
  * @typedef {{ root: string, store: Store, id: string }} Ref
  * @typedef {{ state: 'credentials' | 'offMain', detail: string }} Problem
- * @typedef {{ uri: vscode.Uri, line: number, thread: store.Thread }} Listed
+ * @typedef {{ key: string, uri: vscode.Uri, line: number, thread: store.Thread, unread: number }} Listed
+ * @typedef {{ key: string, ref: Ref, commentId: string, body: string }} CommentRef
  * @typedef {{ sha: string, branch: string, main: string }} Head
  */
 
@@ -62,6 +63,20 @@ function activate(context) {
   const drawn = new Map();
   let drawnTree = '';
   const headOf = (/** @type {string} */ root) => memo(heads, root, () => readHead(root));
+  /** @type {Map<string, Promise<string>>} each workspace folder's git user.name, '' when unset */
+  const names = new Map();
+  const nameOf = (/** @type {string} */ root) => memo(names, root, () => git(root, 'config', 'user.name').catch(() => ''));
+  /** @type {Set<string>} threads with a comment being edited, which syncs leave alone */
+  const editing = new Set();
+  /** @type {WeakMap<vscode.Comment, CommentRef>} */
+  const commentRefs = new WeakMap();
+  // Comment ids this person has seen, per thread, kept per machine. A store seen for the first time
+  // counts as read, so installing the extension doesn't flag every old comment as new.
+  /** @type {Record<string, string[]>} */
+  const readIds = context.globalState.get('lineComments.read') ?? {};
+  const knownStores = new Set(/** @type {string[]} */ (context.globalState.get('lineComments.knownStores') ?? []));
+  /** @type {Set<string>} comments already announced this session */
+  const announced = new Set();
 
   /** @type {vscode.CommentingRangeProvider} */
   const ranges = {
@@ -150,6 +165,8 @@ function activate(context) {
     const seen = new Set();
     /** @type {Listed[]} */
     const nextListed = [];
+    /** @type {{ comment: store.Comment, listed: Listed }[]} */
+    const replies = [];
     let archived = 0;
     for (const [root, { store: s, key: storeKey, sha, loaded }] of next) {
       if (loaded === undefined) {
@@ -157,6 +174,14 @@ function activate(context) {
         nextListed.push(...listed.filter((l) => rootOf(l.uri) === root));
         continue;
       }
+      const me = await nameOf(root);
+      if (!knownStores.has(storeKey)) {
+        for (const item of loaded) if ('thread' in item) readIds[`${storeKey}\0${item.id}`] = item.thread.comments.map((c) => c.id);
+        knownStores.add(storeKey);
+        await context.globalState.update('lineComments.knownStores', [...knownStores]);
+      }
+      const present = new Set(loaded.map((item) => `${storeKey}\0${item.id}`));
+      for (const key of Object.keys(readIds)) if (key.startsWith(`${storeKey}\0`) && !present.has(key)) delete readIds[key];
       /** @type {{ id: string, thread: store.Thread }[]} */
       const visible = [];
       for (const item of loaded) {
@@ -171,7 +196,12 @@ function activate(context) {
       visible.forEach(({ id, thread }, i) => {
         const key = `${storeKey}\0${id}`;
         seen.add(key);
-        nextListed.push(render(key, { root, store: s, id }, thread, placed[i]));
+        const read = new Set(readIds[key] ?? []);
+        const fresh = thread.comments.filter((c) => c.author !== me && !read.has(c.id));
+        const l = render(key, { root, store: s, id }, thread, placed[i], fresh.length, me);
+        nextListed.push(l);
+        // Replies are announced only in threads this person has written in.
+        if (thread.comments.some((c) => c.author === me)) for (const c of fresh) replies.push({ comment: c, listed: l });
       });
     }
     for (const [key, thread] of shown) {
@@ -179,19 +209,23 @@ function activate(context) {
       thread.dispose();
       shown.delete(key);
       drawn.delete(key);
+      editing.delete(key);
       refs.delete(thread);
     }
+    await context.globalState.update('lineComments.read', readIds);
 
     // Each distinct problem notifies once, not on every sync while it persists.
     for (const f of failures) if (!errors.has(f)) showError(f);
     errors = new Set(failures);
 
     listed = nextListed;
-    const tree = JSON.stringify(listed.map((l) => [l.uri.toString(), l.line, l.thread]));
+    const tree = JSON.stringify(listed.map((l) => [l.uri.toString(), l.line, l.thread, l.unread]));
     if (tree !== drawnTree) treeChanged.fire();
     drawnTree = tree;
-    const open = listed.filter((l) => !l.thread.archived).length;
-    view.badge = open > 0 ? { value: open, tooltip: `${open} open comment thread${open === 1 ? '' : 's'}` } : undefined;
+    const unread = listed.filter((l) => l.unread > 0).length;
+    view.badge = unread > 0 ? { value: unread, tooltip: `${unread} thread${unread === 1 ? '' : 's'} with new comments` } : undefined;
+    announce(replies.filter(({ comment, listed: l }) => !announced.has(`${l.key}\0${comment.id}`) && !onScreen(l)));
+    markVisibleRead();
     view.description = problem?.detail ?? (showArchived ? 'showing archived' : archived > 0 ? `${archived} archived` : undefined);
     // Problems explain themselves in the view's welcome content, which has buttons and hides under a message.
     view.message = problem ? undefined : failures[0];
@@ -211,9 +245,13 @@ function activate(context) {
     const [first, ...replies] = l.thread.comments;
     const item = new vscode.TreeItem(first.body.split('\n')[0]);
     const more = replies.length === 0 ? '' : ` · ${replies.length} repl${replies.length === 1 ? 'y' : 'ies'}`;
-    item.description = `${first.author} · Ln ${l.line + 1}${more}`;
+    item.description = `${l.unread > 0 ? `${l.unread} new · ` : ''}${first.author} · Ln ${l.line + 1}${more}`;
     item.tooltip = new vscode.MarkdownString(l.thread.comments.map((c) => `**${c.author}:** ${c.body}`).join('\n\n'));
-    item.iconPath = new vscode.ThemeIcon(l.thread.archived ? 'archive' : 'comment-discussion');
+    item.iconPath = l.thread.archived
+      ? new vscode.ThemeIcon('archive')
+      : l.unread > 0
+        ? new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('notificationsInfoIcon.foreground'))
+        : new vscode.ThemeIcon('comment-discussion');
     const at = new vscode.Range(l.line, 0, l.line, 0);
     item.command = { title: 'Go to thread', command: 'vscode.open', arguments: [l.uri, { selection: at }] };
     return item;
@@ -280,19 +318,21 @@ function activate(context) {
   }
 
   /**
-   * @param {string} key @param {Ref} ref @param {store.Thread} thread
-   * @param {import('./track').Located} now @returns {Listed}
+   * @param {string} key @param {Ref} ref @param {store.Thread} thread @param {import('./track').Located} now
+   * @param {number} unread comments from others not yet seen @param {string} me git user.name @returns {Listed}
    */
-  function render(key, ref, thread, now) {
+  function render(key, ref, thread, now, unread, me) {
     const uri = vscode.Uri.file(path.join(ref.root, now.path));
+    const listedAs = { key, uri, line: now.line, thread, unread };
     let t = shown.get(key);
+    if (t && editing.has(key)) return listedAs;
     if (t && t.uri.fsPath !== uri.fsPath) {
       // A thread's file is fixed at creation, so a renamed file needs a new thread.
       t.dispose();
       refs.delete(t);
       t = undefined;
     }
-    const sig = JSON.stringify([now, thread]);
+    const sig = JSON.stringify([now, thread, unread, me]);
     if (!t) {
       t = controller.createCommentThread(uri, new vscode.Range(now.line, 0, now.line, 0), []);
       t.collapsibleState = thread.archived
@@ -303,24 +343,128 @@ function activate(context) {
       // Reassigning an unchanged thread's fields would still make VS Code redraw its widget. The range is
       // checked too: VS Code shifts a thread itself when it reloads a file changed on disk.
       refs.set(t, ref);
-      return { uri, line: now.line, thread };
+      return listedAs;
     }
     drawn.set(key, sig);
     refs.set(t, ref);
     t.range = new vscode.Range(now.line, 0, now.line, 0);
-    t.comments = thread.comments.map((c) => ({
-      body: new vscode.MarkdownString(c.body),
-      mode: vscode.CommentMode.Preview,
-      author: { name: c.author },
-      timestamp: new Date(c.at),
-    }));
+    t.comments = thread.comments.map((c) => {
+      /** @type {vscode.Comment} */
+      const shownComment = {
+        body: new vscode.MarkdownString(c.body),
+        mode: vscode.CommentMode.Preview,
+        author: { name: c.author },
+        timestamp: new Date(c.at),
+        label: c.edited ? 'edited' : undefined,
+        contextValue: c.author === me ? 'mine' : undefined,
+      };
+      commentRefs.set(shownComment, { key, ref, commentId: c.id, body: c.body });
+      return shownComment;
+    });
     t.contextValue = thread.archived ? 'archived' : 'open';
     t.state = thread.archived ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
     const count = `${thread.comments.length} comment${thread.comments.length === 1 ? '' : 's'}`;
-    t.label = [thread.archived && 'Archived', count, now.stale && `line since changed from: ${thread.text.trim()}`]
+    const fresh = unread > 0 && `${unread} new`;
+    t.label = [thread.archived && 'Archived', fresh, count, now.stale && `line since changed from: ${thread.text.trim()}`]
       .filter(Boolean)
       .join(' · ');
-    return { uri, line: now.line, thread };
+    return listedAs;
+  }
+
+  /** Whether a thread's line is on screen in a focused window, which counts as reading it. @param {Listed} l */
+  function onScreen(l) {
+    if (!vscode.window.state.focused) return false;
+    return vscode.window.visibleTextEditors.some(
+      (e) => e.document.uri.fsPath === l.uri.fsPath && e.visibleRanges.some((r) => r.start.line <= l.line && l.line <= r.end.line),
+    );
+  }
+
+  /** @param {Listed[]} threads */
+  async function markRead(threads) {
+    if (threads.length === 0) return;
+    for (const l of threads) readIds[l.key] = l.thread.comments.map((c) => c.id);
+    await context.globalState.update('lineComments.read', readIds);
+    resync();
+  }
+
+  const markVisibleRead = () => guard(markRead)(listed.filter((l) => l.unread > 0 && onScreen(l)));
+
+  /** One notification per sync: the reply itself, or a count when several arrived. @param {{ comment: store.Comment, listed: Listed }[]} news */
+  function announce(news) {
+    if (news.length === 0) return;
+    for (const { comment, listed: l } of news) announced.add(`${l.key}\0${comment.id}`);
+    const show = 'Show';
+    if (news.length === 1) {
+      const [{ comment, listed: l }] = news;
+      const where = `${vscode.workspace.asRelativePath(l.uri)}:${l.line + 1}`;
+      vscode.window.showInformationMessage(`${comment.author} replied on ${where}: ${comment.body.split('\n')[0]}`, show).then((pick) => {
+        if (pick === show) vscode.commands.executeCommand('vscode.open', l.uri, { selection: new vscode.Range(l.line, 0, l.line, 0) });
+      });
+    } else {
+      vscode.window.showInformationMessage(`${news.length} new replies in threads you're in`, show).then((pick) => {
+        if (pick === show) vscode.commands.executeCommand('lineComments.threads.focus');
+      });
+    }
+  }
+
+  /** @param {vscode.Comment} c @returns {CommentRef} */
+  function commentRef(c) {
+    const r = commentRefs.get(c);
+    if (!r) throw new Error('this comment is not saved yet');
+    return r;
+  }
+
+  /** Redraws a thread's comments in place, after switching one into or out of edit mode. @param {string} key */
+  function redraw(key) {
+    const t = shown.get(key);
+    if (t) t.comments = [...t.comments];
+  }
+
+  /** @param {vscode.Comment} c */
+  function editComment(c) {
+    const { key } = commentRef(c);
+    editing.add(key);
+    c.mode = vscode.CommentMode.Editing;
+    redraw(key);
+  }
+
+  /** @param {vscode.Comment} c */
+  async function saveComment(c) {
+    const { key, ref, commentId } = commentRef(c);
+    const body = typeof c.body === 'string' ? c.body : c.body.value;
+    await ref.store.editComment(ref.id, commentId, body, new Date().toISOString());
+    editing.delete(key);
+    drawn.delete(key);
+    await sync();
+  }
+
+  /** @param {vscode.Comment} c */
+  function cancelEdit(c) {
+    const { key, body } = commentRef(c);
+    c.body = new vscode.MarkdownString(body);
+    c.mode = vscode.CommentMode.Preview;
+    editing.delete(key);
+    redraw(key);
+  }
+
+  /** @param {vscode.Comment} c */
+  async function deleteComment(c) {
+    const { key, ref, commentId } = commentRef(c);
+    const last = (shown.get(key)?.comments.length ?? 0) <= 1;
+    const choice = await vscode.window.showWarningMessage(
+      'Delete this comment?',
+      { modal: true, detail: last ? 'It is the only comment, so the thread goes too.' : undefined },
+      'Delete',
+    );
+    if (choice !== 'Delete') return;
+    if (last) await ref.store.remove(ref.id);
+    else await ref.store.removeComment(ref.id, commentId);
+    drawn.delete(key);
+    await sync();
+  }
+
+  async function markAllRead() {
+    await markRead(listed.filter((l) => l.unread > 0));
   }
 
   /** @param {vscode.CommentReply} reply */
@@ -339,6 +483,8 @@ function activate(context) {
     const ref = refs.get(thread);
     if (ref) {
       await ref.store.reply(ref.id, entry);
+      const l = listed.find((x) => shown.get(x.key) === thread);
+      if (l) await markRead([l]);
     } else {
       const doc = await vscode.workspace.openTextDocument(thread.uri);
       const line = thread.range.start.line;
@@ -437,6 +583,15 @@ function activate(context) {
     vscode.commands.registerCommand('lineComments.setS3Credentials', guard(setS3Credentials)),
     vscode.commands.registerCommand('lineComments.refresh', guard(refresh)),
     vscode.commands.registerCommand('lineComments.switchToDefault', guard(switchToDefault)),
+    vscode.commands.registerCommand('lineComments.editComment', guard(editComment)),
+    vscode.commands.registerCommand('lineComments.saveComment', guard(saveComment)),
+    vscode.commands.registerCommand('lineComments.cancelEdit', guard(cancelEdit)),
+    vscode.commands.registerCommand('lineComments.deleteComment', guard(deleteComment)),
+    vscode.commands.registerCommand('lineComments.markAllRead', guard(markAllRead)),
+    // A thread scrolled into view in a focused window counts as read.
+    vscode.window.onDidChangeTextEditorVisibleRanges(debounce(markVisibleRead, 500)),
+    vscode.window.onDidChangeVisibleTextEditors(debounce(markVisibleRead, 500)),
+    vscode.window.onDidChangeWindowState(debounce(markVisibleRead, 500)),
   );
   guard(rewatch)();
 }
@@ -490,6 +645,16 @@ async function readHead(root) {
   }
   const [sha, branch, origin] = out.split('\n');
   return { sha, branch, main: origin.replace(/^origin\//, '') };
+}
+
+/** @param {() => void} fn @param {number} ms */
+function debounce(fn, ms) {
+  /** @type {NodeJS.Timeout | undefined} */
+  let timer;
+  return () => {
+    clearTimeout(timer);
+    timer = setTimeout(fn, ms);
+  };
 }
 
 /**

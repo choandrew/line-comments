@@ -62,6 +62,23 @@ for (const [backend, fresh] of Object.entries(backends)) {
     assert.equal((await b.list('owner/repo/')).size, 0);
   });
 
+  test(`${backend}: editing or deleting a comment touches only that comment`, async () => {
+    // Catches: an edit losing its author or time, or a delete taking the rest of the thread with it.
+    const s = store.open(fresh(), 'owner/repo/');
+    const id = await s.create(anchor, comment('tyop', '2026-01-01T10:00:00.000Z'));
+    await s.reply(id, comment('reply', '2026-01-01T11:00:00.000Z'));
+    const [before] = await s.readAll();
+    assert.ok('thread' in before);
+    const [first, second] = before.thread.comments;
+    await s.editComment(id, first.id, 'typo', '2026-01-02T09:00:00.000Z');
+    await s.removeComment(id, second.id);
+    const [after] = await s.readAll();
+    assert.ok('thread' in after);
+    assert.deepEqual(after.thread.comments, [
+      { id: first.id, author: 'Ada', body: 'typo', at: '2026-01-01T10:00:00.000Z', edited: '2026-01-02T09:00:00.000Z' },
+    ]);
+  });
+
   test(`${backend}: repos sharing a location see only their own threads`, async () => {
     // Catches: one user-level location mixing threads from different repos.
     const b = fresh();
