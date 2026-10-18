@@ -28,8 +28,9 @@ One user-level setting covers every repo: each repo's threads go under
 }
 ```
 
-Then click **Set S3 Credentials** in the Line Comments side bar. The key is kept in VS
-Code's secret storage, never in settings. S3 has no change notifications, so new comments from
+Requests go without a key at first, so a store that allows anonymous access needs no setup. If
+the store refuses them, the Line Comments side bar shows **Set S3 Credentials**; the key is kept
+in VS Code's secret storage, never in settings. S3 has no change notifications, so new comments from
 others appear within 10 seconds.
 
 **Shared through a folder:** set `lineComments.location` to it, e.g.
@@ -90,6 +91,7 @@ npm ci && npm run check
 ```
 
 `npm run check` also runs the store tests against S3 when `LINE_COMMENTS_TEST_S3` names a bucket,
-e.g. `http://test-key:test-secret@localhost:18333/test`; CI starts a SeaweedFS for this.
+e.g. `http://test-key:test-secret@localhost:18333/test`, and against an anonymous one when
+`LINE_COMMENTS_TEST_S3_OPEN` does, e.g. `http://localhost:18334/test`; CI starts a SeaweedFS for each.
 
 Push a `v*` tag to build and publish a release.

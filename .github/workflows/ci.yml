@@ -21,10 +21,16 @@ jobs:
           docker run -d --name seaweedfs -p 18333:8333 -v /tmp/s3.json:/etc/s3.json:ro chrislusf/seaweedfs:4.48 server -s3 -s3.config=/etc/s3.json
           timeout 60 sh -c 'until curl -s -o /dev/null http://localhost:18333/; do sleep 1; done'
           echo 's3.bucket.create -name test' | docker exec -i seaweedfs weed shell
+      - name: Start SeaweedFS without auth
+        run: |
+          docker run -d --name seaweedfs-open -p 18334:8333 chrislusf/seaweedfs:4.48 server -s3
+          timeout 60 sh -c 'until curl -s -o /dev/null http://localhost:18334/; do sleep 1; done'
+          echo 's3.bucket.create -name test' | docker exec -i seaweedfs-open weed shell
       - run: npm ci
       - run: npm run check
         env:
           LINE_COMMENTS_TEST_S3: http://test-key:test-secret@localhost:18333/test
+          LINE_COMMENTS_TEST_S3_OPEN: http://localhost:18334/test
       - run: npm run package
       - uses: actions/upload-artifact@v4
         with:

@@ -1,10 +1,21 @@
 // @ts-check
-// Minimal path-style S3 client with SigV4 signing, enough for S3-compatible stores (SeaweedFS, MinIO, AWS).
+// Minimal path-style S3 client, enough for S3-compatible stores (SeaweedFS, MinIO, AWS). Requests are
+// SigV4-signed when credentials are given and anonymous otherwise.
 const crypto = require('crypto');
 
 /**
- * @typedef {{ endpoint: string, region: string, bucket: string, accessKeyId: string, secretAccessKey: string }} S3Config
+ * @typedef {{ accessKeyId: string, secretAccessKey: string }} Credentials
+ * @typedef {{ endpoint: string, region: string, bucket: string, credentials?: Credentials }} S3Config
  */
+
+/** A non-2xx answer; `status` lets callers tell "needs a key" (403) from other failures. */
+class S3Error extends Error {
+  /** @param {string} message @param {number} status */
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+}
 
 /** @param {string} data */
 const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
@@ -28,10 +39,28 @@ async function request(cfg, method, key, query = {}, body = '') {
     .sort()
     .map((k) => `${enc(k)}=${enc(query[k])}`)
     .join('&');
+  const res = await fetch(`${origin.origin}${pathname}${qs ? `?${qs}` : ''}`, {
+    method,
+    headers: cfg.credentials ? sign(cfg.credentials, cfg.region, origin.host, method, pathname, qs, body) : {},
+    body: method === 'PUT' ? body : undefined,
+  });
+  if (!res.ok) {
+    const code = /<Code>([^<]*)<\/Code>/.exec(await res.text())?.[1] ?? '';
+    throw new S3Error(`S3 ${method} ${cfg.bucket}/${key}: HTTP ${res.status} ${code}`.trim(), res.status);
+  }
+  return res;
+}
+
+/**
+ * SigV4 headers for one request.
+ * @param {Credentials} creds @param {string} region @param {string} host @param {string} method
+ * @param {string} pathname @param {string} qs @param {string} body @returns {Record<string, string>}
+ */
+function sign(creds, region, host, method, pathname, qs, body) {
   const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, '');
   const day = amzDate.slice(0, 8);
   const payload = sha256(body);
-  const signed = { host: origin.host, 'x-amz-content-sha256': payload, 'x-amz-date': amzDate };
+  const signed = { host, 'x-amz-content-sha256': payload, 'x-amz-date': amzDate };
   const names = Object.keys(signed).join(';');
   const canonical = [
     method,
@@ -41,24 +70,15 @@ async function request(cfg, method, key, query = {}, body = '') {
     names,
     payload,
   ].join('\n');
-  const scope = `${day}/${cfg.region}/s3/aws4_request`;
+  const scope = `${day}/${region}/s3/aws4_request`;
   const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256(canonical)].join('\n');
-  const key4 = ['aws4_request', 's3', cfg.region, day].reduceRight((k, part) => hmac(k, part), Buffer.from(`AWS4${cfg.secretAccessKey}`));
-  const signature = crypto.createHmac('sha256', key4).update(toSign).digest('hex');
-  const res = await fetch(`${origin.origin}${pathname}${qs ? `?${qs}` : ''}`, {
-    method,
-    headers: {
-      'x-amz-content-sha256': payload,
-      'x-amz-date': amzDate,
-      authorization: `AWS4-HMAC-SHA256 Credential=${cfg.accessKeyId}/${scope}, SignedHeaders=${names}, Signature=${signature}`,
-    },
-    body: method === 'PUT' ? body : undefined,
-  });
-  if (!res.ok) {
-    const code = /<Code>([^<]*)<\/Code>/.exec(await res.text())?.[1] ?? '';
-    throw new Error(`S3 ${method} ${cfg.bucket}/${key}: HTTP ${res.status} ${code}`.trim());
-  }
-  return res;
+  const key = ['aws4_request', 's3', region, day].reduceRight((k, part) => hmac(k, part), Buffer.from(`AWS4${creds.secretAccessKey}`));
+  const signature = crypto.createHmac('sha256', key).update(toSign).digest('hex');
+  return {
+    'x-amz-content-sha256': payload,
+    'x-amz-date': amzDate,
+    authorization: `AWS4-HMAC-SHA256 Credential=${creds.accessKeyId}/${scope}, SignedHeaders=${names}, Signature=${signature}`,
+  };
 }
 
 /** Every key under `prefix` with its ETag. @param {S3Config} cfg @param {string} prefix */
@@ -93,4 +113,4 @@ const put = async (cfg, key, text) => void (await request(cfg, 'PUT', key, {}, t
 /** @param {S3Config} cfg @param {string} key */
 const del = async (cfg, key) => void (await request(cfg, 'DELETE', key));
 
-module.exports = { list, get, put, del };
+module.exports = { S3Error, list, get, put, del };

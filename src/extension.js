@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const blob = require('./blob');
+const { S3Error } = require('./s3');
 const store = require('./store');
 const { git, locate } = require('./track');
 
@@ -64,7 +65,7 @@ function activate(context) {
 
   /**
    * The store for a workspace folder, or the problem stopping one.
-   * @param {string} root @returns {Promise<{ store: Store, key: string, remote: boolean } | { problem: Problem }>}
+   * @param {string} root @returns {Promise<{ store: Store, key: string, remote: boolean, anonymous: boolean }>}
    */
   async function storeFor(root) {
     const config = vscode.workspace.getConfiguration('lineComments', vscode.Uri.file(root));
@@ -76,17 +77,18 @@ function activate(context) {
       const url = new URL(location);
       const prefix = url.pathname.replace(/^\/+|\/+$/g, '');
       const saved = await context.secrets.get(secretKey(endpoint));
-      if (saved === undefined) return { problem: { state: 'credentials', message: `Needs the S3 access key for ${endpoint}.` } };
-      const { accessKeyId, secretAccessKey } = JSON.parse(saved);
-      const cfg = { endpoint, region, bucket: url.hostname, accessKeyId, secretAccessKey };
+      // No saved key means anonymous requests, for stores that allow them.
+      const credentials = saved === undefined ? undefined : JSON.parse(saved);
+      const cfg = { endpoint, region, bucket: url.hostname, credentials };
       const key = `${location}\0${endpoint}\0${repo}`;
-      return { store: cached(key, () => blob.bucket(cfg, prefix ? `${prefix}/` : ''), repo), key, remote: true };
+      const store = cached(key, () => blob.bucket(cfg, prefix ? `${prefix}/` : ''), repo);
+      return { store, key, remote: true, anonymous: credentials === undefined };
     }
     const dir = expand(root, location);
     if (location === DEFAULT_LOCATION) fs.mkdirSync(dir, { recursive: true });
     if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`lineComments.location ${dir} is not a folder`);
     const key = `${dir}\0\0${repo}`;
-    return { store: cached(key, () => blob.folder(dir), repo), key, remote: false };
+    return { store: cached(key, () => blob.folder(dir), repo), key, remote: false, anonymous: false };
   }
 
   /** @param {string} key @param {() => blob.Blob} make @param {string} repo */
@@ -102,18 +104,12 @@ function activate(context) {
     const failures = [];
     /** @type {Problem | undefined} */
     let problem;
-    /** @type {Map<string, Store>} */
+    /** @type {Map<string, { store: Store, key: string, loaded: store.Loaded[] | undefined }>} */
     const next = new Map();
-    /** @type {Map<string, string>} */
-    const keys = new Map();
     remote = false;
     for (const root of roots()) {
       try {
         const found = await storeFor(root);
-        if ('problem' in found) {
-          problem ??= found.problem;
-          continue;
-        }
         const { branch, main } = branches(root);
         if (branch !== main) {
           problem ??= {
@@ -122,15 +118,25 @@ function activate(context) {
           };
           continue;
         }
-        next.set(root, found.store);
-        keys.set(root, found.key);
+        let loaded;
+        try {
+          loaded = await found.store.readAll();
+        } catch (e) {
+          if (found.anonymous && e instanceof S3Error && e.status === 403) {
+            problem ??= { state: 'credentials', message: 'This S3 location needs an access key.' };
+            continue;
+          }
+          // An unreachable store keeps what is on screen rather than wiping it.
+          failures.push(message(e));
+        }
+        next.set(root, { store: found.store, key: found.key, loaded });
         remote ||= found.remote;
       } catch (e) {
         failures.push(message(e));
       }
     }
     const changed = next.size !== active.size || [...next.keys()].some((r) => !active.has(r));
-    active = next;
+    active = new Map([...next].map(([root, n]) => [root, n.store]));
     // VS Code caches commenting ranges per editor; assigning the provider again makes it re-ask.
     if (changed) controller.commentingRangeProvider = ranges;
 
@@ -138,14 +144,9 @@ function activate(context) {
     /** @type {Listed[]} */
     const nextListed = [];
     let archived = 0;
-    for (const [root, s] of active) {
-      let loaded;
-      try {
-        loaded = await s.readAll();
-      } catch (e) {
-        failures.push(message(e));
-        // An unreachable store keeps what is on screen rather than wiping it.
-        for (const [key] of shown) if (key.startsWith(`${keys.get(root)}\0`)) seen.add(key);
+    for (const [root, { store: s, key: storeKey, loaded }] of next) {
+      if (loaded === undefined) {
+        for (const [key] of shown) if (key.startsWith(`${storeKey}\0`)) seen.add(key);
         nextListed.push(...listed.filter((l) => rootOf(l.uri) === root));
         continue;
       }
@@ -156,7 +157,7 @@ function activate(context) {
         }
         if (item.thread.archived) archived++;
         if (item.thread.archived && !showArchived) continue;
-        const key = `${keys.get(root)}\0${item.id}`;
+        const key = `${storeKey}\0${item.id}`;
         seen.add(key);
         nextListed.push(render(key, { root, store: s, id: item.id }, item.thread));
       }

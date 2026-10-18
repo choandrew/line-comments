@@ -3,7 +3,7 @@
   "displayName": "Line Comments",
   "description": "GitHub-style line comment threads in VS Code, outside any pull request, shared through a folder or an S3 bucket such as SeaweedFS.",
   "publisher": "choandrew",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -44,7 +44,7 @@
         "lineComments.s3.endpoint": {
           "type": "string",
           "scope": "resource",
-          "markdownDescription": "S3 endpoint URL for an `s3://` location, e.g. `http://seaweedfs:8333` or `https://s3.us-east-1.amazonaws.com`. Set the access key with **Line Comments: Set S3 Credentials**."
+          "markdownDescription": "S3 endpoint URL for an `s3://` location, e.g. `http://seaweedfs:8333` or `https://s3.us-east-1.amazonaws.com`. Requests go without a key until the store refuses one; then the side bar asks for it (**Line Comments: Set S3 Credentials**)."
         },
         "lineComments.s3.region": {
           "type": "string",
@@ -75,7 +75,7 @@
       {
         "view": "lineComments.threads",
         "when": "lineComments.state == credentials",
-        "contents": "Enter the S3 access key so Line Comments can reach your comments.\n[Set S3 Credentials](command:lineComments.setS3Credentials)"
+        "contents": "This S3 location turned away a request without an access key. Enter one to reach your comments.\n[Set S3 Credentials](command:lineComments.setS3Credentials)"
       },
       {
         "view": "lineComments.threads",
