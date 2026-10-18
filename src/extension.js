@@ -11,7 +11,7 @@ const { git, locate } = require('./track');
 /**
  * @typedef {ReturnType<typeof store.open>} Store
  * @typedef {{ root: string, store: Store, id: string }} Ref
- * @typedef {{ state: 'credentials' | 'offMain', message: string }} Problem
+ * @typedef {{ state: 'credentials' | 'offMain', detail: string }} Problem
  * @typedef {{ uri: vscode.Uri, line: number, thread: store.Thread }} Listed
  */
 
@@ -112,10 +112,7 @@ function activate(context) {
         const found = await storeFor(root);
         const { branch, main } = branches(root);
         if (branch !== main) {
-          problem ??= {
-            state: 'offMain',
-            message: `${path.basename(root)} is on ${branch}. Comments show only on ${main}, because their lines refer to it.`,
-          };
+          problem ??= { state: 'offMain', detail: `${path.basename(root)} is on ${branch}, not ${main}` };
           continue;
         }
         let loaded;
@@ -123,7 +120,7 @@ function activate(context) {
           loaded = await found.store.readAll();
         } catch (e) {
           if (found.anonymous && e instanceof S3Error && e.status === 403) {
-            problem ??= { state: 'credentials', message: 'This S3 location needs an access key.' };
+            problem ??= { state: 'credentials', detail: 'needs an S3 access key' };
             continue;
           }
           // An unreachable store keeps what is on screen rather than wiping it.
@@ -177,9 +174,9 @@ function activate(context) {
     treeChanged.fire();
     const open = listed.filter((l) => !l.thread.archived).length;
     view.badge = open > 0 ? { value: open, tooltip: `${open} open comment thread${open === 1 ? '' : 's'}` } : undefined;
-    view.description = showArchived ? 'showing archived' : archived > 0 ? `${archived} archived` : undefined;
-    // The credentials state uses the view's welcome content, which carries a button and hides under a message.
-    view.message = problem?.state === 'credentials' ? undefined : problem?.message ?? failures[0];
+    view.description = problem?.detail ?? (showArchived ? 'showing archived' : archived > 0 ? `${archived} archived` : undefined);
+    // Problems explain themselves in the view's welcome content, which has buttons and hides under a message.
+    view.message = problem ? undefined : failures[0];
     const state = problem?.state ?? (active.size > 0 ? 'ready' : 'none');
     await vscode.commands.executeCommand('setContext', 'lineComments.state', state);
   }
@@ -342,6 +339,14 @@ function activate(context) {
     await sync();
   }
 
+  function switchToDefault() {
+    for (const root of roots()) {
+      const { branch, main } = branches(root);
+      if (branch !== main) git(root, 'switch', main);
+    }
+    resync();
+  }
+
   async function setS3Credentials() {
     const config = (/** @type {string} */ r) => vscode.workspace.getConfiguration('lineComments', vscode.Uri.file(r));
     const root = roots().find((r) => setting(config(r), 'location').startsWith('s3://'));
@@ -385,6 +390,7 @@ function activate(context) {
     vscode.commands.registerCommand('lineComments.toggleArchived', guard(toggleArchived)),
     vscode.commands.registerCommand('lineComments.setS3Credentials', guard(setS3Credentials)),
     vscode.commands.registerCommand('lineComments.refresh', guard(sync)),
+    vscode.commands.registerCommand('lineComments.switchToDefault', guard(switchToDefault)),
   );
   rewatch();
 }

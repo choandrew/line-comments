@@ -3,7 +3,7 @@
   "displayName": "Line Comments",
   "description": "GitHub-style line comment threads in VS Code, outside any pull request, shared through a folder or an S3 bucket such as SeaweedFS.",
   "publisher": "choandrew",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -79,6 +79,11 @@
       },
       {
         "view": "lineComments.threads",
+        "when": "lineComments.state == offMain",
+        "contents": "Comments show only on the default branch, because their line numbers refer to it.\n[Switch to Default Branch](command:lineComments.switchToDefault)"
+      },
+      {
+        "view": "lineComments.threads",
         "when": "lineComments.state == ready",
         "contents": "No comments yet. Hover a line number in any file and click + to start a thread."
       },
@@ -125,6 +130,11 @@
         "title": "Refresh",
         "category": "Line Comments",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "lineComments.switchToDefault",
+        "title": "Switch to Default Branch",
+        "category": "Line Comments"
       }
     ],
     "menus": {
