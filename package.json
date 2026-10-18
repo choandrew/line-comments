@@ -22,6 +22,9 @@
     "vscode": "^1.90.0"
   },
   "main": "src/extension.js",
+  "bin": {
+    "line-comments": "bin/line-comments.js"
+  },
   "activationEvents": [
     "onStartupFinished"
   ],

@@ -30,6 +30,14 @@ S3 store needs a key, the side bar asks for one.
 - The Line Comments side bar lists every thread and shows archived ones on request.
 - Comments show only on the default branch (usually `main`) and follow the code as it changes.
 
+## For agents
+
+`npx -y github:choandrew/line-comments open` prints the repo's open threads as `path:line: [author] body`,
+replies indented, at the lines they sit on in your working tree. It finds the location as the extension
+does; `--location`, `--endpoint` or `LINE_COMMENTS_LOCATION` override it. Put this in AGENTS.md or CLAUDE.md:
+
+> Open line comments: run `npx -y github:choandrew/line-comments open`; address each, then archive or reply in VS Code.
+
 ## Storage format
 
 ```
