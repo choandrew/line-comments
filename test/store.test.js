@@ -1,6 +1,7 @@
 // @ts-check
-// Runs against a folder always, and against S3 when LINE_COMMENTS_TEST_S3 names a bucket, e.g.
-// http://test-key:test-secret@localhost:18333/test (the ci workflow starts a SeaweedFS for this).
+// Runs against a folder always, and against S3 when these name buckets (the ci workflow starts both):
+// LINE_COMMENTS_TEST_S3       a store that needs a key, e.g. http://test-key:test-secret@localhost:18333/test
+// LINE_COMMENTS_TEST_S3_OPEN  a store that allows anonymous access, e.g. http://localhost:18334/test
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
@@ -8,6 +9,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const blob = require('../src/blob');
+const s3 = require('../src/s3');
 const store = require('../src/store');
 
 const anchor = { path: 'src/app.py', line: 3, text: '    total = a + b', commit: 'a'.repeat(40) };
@@ -17,18 +19,17 @@ const comment = (body, at) => ({ author: 'Ada', body, at });
 /** @type {Record<string, () => blob.Blob>} each call gets a fresh, empty place */
 const backends = { folder: () => blob.folder(fs.mkdtempSync(path.join(os.tmpdir(), 'line-comments-'))) };
 const s3url = process.env.LINE_COMMENTS_TEST_S3;
+const openUrl = process.env.LINE_COMMENTS_TEST_S3_OPEN;
 if (s3url) backends.s3 = () => blob.bucket(s3config(s3url), `run-${crypto.randomUUID()}/`);
+if (openUrl) backends['s3 anonymous'] = () => blob.bucket(s3config(openUrl), `run-${crypto.randomUUID()}/`);
 
-/** @param {string} url @param {string} [secret] */
+/** Credentials come from the URL's user and password, if any. @param {string} url @param {string} [secret] */
 function s3config(url, secret) {
   const u = new URL(url);
-  return {
-    endpoint: u.origin,
-    region: 'us-east-1',
-    bucket: u.pathname.slice(1),
-    accessKeyId: decodeURIComponent(u.username),
-    secretAccessKey: secret ?? decodeURIComponent(u.password),
-  };
+  const credentials = u.username
+    ? { accessKeyId: decodeURIComponent(u.username), secretAccessKey: secret ?? decodeURIComponent(u.password) }
+    : undefined;
+  return { endpoint: u.origin, region: 'us-east-1', bucket: u.pathname.slice(1), credentials };
 }
 
 for (const [backend, fresh] of Object.entries(backends)) {
@@ -98,5 +99,14 @@ if (s3url) {
     // Catches: bad credentials looking like an empty, comment-free repo.
     const b = blob.bucket(s3config(s3url, 'wrong'), 'x/');
     await assert.rejects(b.list(''), /HTTP 403/);
+  });
+
+  test('s3: a store that needs a key refuses anonymous requests with status 403', async () => {
+    // Catches: the side bar never offering Set S3 Credentials because the refusal is not recognizable.
+    const u = new URL(s3url);
+    u.username = '';
+    u.password = '';
+    const b = blob.bucket(s3config(u.toString()), 'x/');
+    await assert.rejects(b.list(''), (e) => e instanceof s3.S3Error && e.status === 403);
   });
 }
